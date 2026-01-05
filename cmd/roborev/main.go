@@ -279,7 +279,7 @@ func enqueueCmd() *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "enqueue",
+		Use:   "enqueue [commit]",
 		Short: "Enqueue a commit for review",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Ensure daemon is running
@@ -296,6 +296,11 @@ func enqueueCmd() *cobra.Command {
 			root, err := git.GetRepoRoot(repoPath)
 			if err != nil {
 				return fmt.Errorf("not a git repository: %w", err)
+			}
+
+			// Use positional arg if provided
+			if len(args) > 0 {
+				sha = args[0]
 			}
 
 			// Resolve SHA
