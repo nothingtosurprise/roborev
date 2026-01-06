@@ -42,6 +42,7 @@ type tuiView int
 const (
 	tuiViewQueue tuiView = iota
 	tuiViewReview
+	tuiViewPrompt
 )
 
 type tuiModel struct {
@@ -52,6 +53,7 @@ type tuiModel struct {
 	currentView   tuiView
 	currentReview *storage.Review
 	reviewScroll  int
+	promptScroll  int
 	width         int
 	height        int
 	err           error
@@ -153,6 +155,11 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.reviewScroll = 0
 				return m, nil
 			}
+			if m.currentView == tuiViewPrompt {
+				m.currentView = tuiViewReview
+				m.promptScroll = 0
+				return m, nil
+			}
 			return m, tea.Quit
 
 		case "up", "k":
@@ -160,9 +167,13 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.selectedIdx > 0 {
 					m.selectedIdx--
 				}
-			} else {
+			} else if m.currentView == tuiViewReview {
 				if m.reviewScroll > 0 {
 					m.reviewScroll--
+				}
+			} else if m.currentView == tuiViewPrompt {
+				if m.promptScroll > 0 {
+					m.promptScroll--
 				}
 			}
 
@@ -171,8 +182,10 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.selectedIdx < len(m.jobs)-1 {
 					m.selectedIdx++
 				}
-			} else {
+			} else if m.currentView == tuiViewReview {
 				m.reviewScroll++
+			} else if m.currentView == tuiViewPrompt {
+				m.promptScroll++
 			}
 
 		case "enter":
@@ -193,11 +206,23 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
+		case "p":
+			if m.currentView == tuiViewReview && m.currentReview != nil && m.currentReview.Prompt != "" {
+				m.currentView = tuiViewPrompt
+				m.promptScroll = 0
+			} else if m.currentView == tuiViewPrompt {
+				m.currentView = tuiViewReview
+				m.promptScroll = 0
+			}
+
 		case "esc":
 			if m.currentView == tuiViewReview {
 				m.currentView = tuiViewQueue
 				m.currentReview = nil
 				m.reviewScroll = 0
+			} else if m.currentView == tuiViewPrompt {
+				m.currentView = tuiViewReview
+				m.promptScroll = 0
 			}
 		}
 
@@ -230,6 +255,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m tuiModel) View() string {
+	if m.currentView == tuiViewPrompt && m.currentReview != nil {
+		return m.renderPromptView()
+	}
 	if m.currentView == tuiViewReview && m.currentReview != nil {
 		return m.renderReviewView()
 	}
@@ -435,7 +463,49 @@ func (m tuiModel) renderReviewView() string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString(tuiHelpStyle.Render("up/down: scroll | esc/q: back"))
+	b.WriteString(tuiHelpStyle.Render("up/down: scroll | p: view prompt | esc/q: back"))
+
+	return b.String()
+}
+
+func (m tuiModel) renderPromptView() string {
+	var b strings.Builder
+
+	review := m.currentReview
+	if review.Job != nil {
+		ref := shortRef(review.Job.GitRef)
+		title := fmt.Sprintf("Prompt: %s (%s)", ref, review.Agent)
+		b.WriteString(tuiTitleStyle.Render(title))
+	} else {
+		b.WriteString(tuiTitleStyle.Render("Prompt"))
+	}
+	b.WriteString("\n")
+
+	// Wrap text to terminal width (max 100 chars)
+	wrapWidth := min(m.width-2, 100)
+	lines := wrapText(review.Prompt, wrapWidth)
+
+	visibleLines := m.height - 5 // Leave room for title and help
+
+	start := m.promptScroll
+	if start >= len(lines) {
+		start = max(0, len(lines)-1)
+	}
+	end := min(start+visibleLines, len(lines))
+
+	for i := start; i < end; i++ {
+		b.WriteString(lines[i])
+		b.WriteString("\n")
+	}
+
+	// Scroll indicator
+	if len(lines) > visibleLines {
+		scrollInfo := fmt.Sprintf("[%d-%d of %d lines]", start+1, end, len(lines))
+		b.WriteString(tuiStatusStyle.Render(scrollInfo))
+		b.WriteString("\n")
+	}
+
+	b.WriteString(tuiHelpStyle.Render("up/down: scroll | p: back to review | esc/q: back"))
 
 	return b.String()
 }
