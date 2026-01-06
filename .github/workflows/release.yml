@@ -45,12 +45,11 @@ jobs:
           mkdir -p dist
           go build -ldflags="-s -w" -o dist/roborev${EXT} ./cmd/roborev
           go build -ldflags="-s -w" -o dist/roborevd${EXT} ./cmd/roborevd
-          go build -ldflags="-s -w" -o dist/roborev-tui${EXT} ./cmd/roborev-tui
 
           cd dist
           ARCHIVE="roborev_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz"
-          tar czf "$ARCHIVE" roborev${EXT} roborevd${EXT} roborev-tui${EXT}
-          rm roborev${EXT} roborevd${EXT} roborev-tui${EXT}
+          tar czf "$ARCHIVE" roborev${EXT} roborevd${EXT}
+          rm roborev${EXT} roborevd${EXT}
 
       - uses: actions/upload-artifact@v4
         with:

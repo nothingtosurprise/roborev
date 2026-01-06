@@ -104,7 +104,7 @@ install_from_release() {
     tar -xzf "$tmpdir/release.tar.gz" -C "$tmpdir"
 
     # Install binaries
-    for bin in roborev roborevd roborev-tui; do
+    for bin in roborev roborevd; do
         if [ -f "$tmpdir/$bin" ]; then
             if [ -w "$install_dir" ]; then
                 mv "$tmpdir/$bin" "$install_dir/"
@@ -117,7 +117,7 @@ install_from_release() {
 
     # macOS code signing
     if [ "$os" = "darwin" ]; then
-        for bin in roborev roborevd roborev-tui; do
+        for bin in roborev roborevd; do
             if [ -f "$install_dir/$bin" ]; then
                 codesign -s - "$install_dir/$bin" 2>/dev/null || true
             fi
@@ -138,7 +138,6 @@ install_from_go() {
     info "Installing via 'go install'..."
     go install "github.com/${REPO}/cmd/roborev@latest"
     go install "github.com/${REPO}/cmd/roborevd@latest"
-    go install "github.com/${REPO}/cmd/roborev-tui@latest"
 
     return 0
 }
