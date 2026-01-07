@@ -300,3 +300,30 @@ func TestTUISelectionEmptyList(t *testing.T) {
 		t.Errorf("Expected selectedJobID=0, got %d", m.selectedJobID)
 	}
 }
+
+func TestTUISelectionMaintainedOnLargeBatch(t *testing.T) {
+	m := newTuiModel("http://localhost")
+
+	// Initial state with 1 job selected
+	m.jobs = []storage.ReviewJob{{ID: 1}}
+	m.selectedIdx = 0
+	m.selectedJobID = 1
+
+	// 30 new jobs added at the top (simulating large batch)
+	newJobs := make([]storage.ReviewJob, 31)
+	for i := 0; i < 30; i++ {
+		newJobs[i] = storage.ReviewJob{ID: int64(31 - i)} // IDs 31, 30, 29, ..., 2
+	}
+	newJobs[30] = storage.ReviewJob{ID: 1} // Original job at the end
+
+	updated, _ := m.Update(tuiJobsMsg(newJobs))
+	m = updated.(tuiModel)
+
+	// Should still follow job ID=1, now at index 30
+	if m.selectedJobID != 1 {
+		t.Errorf("Expected selectedJobID=1, got %d", m.selectedJobID)
+	}
+	if m.selectedIdx != 30 {
+		t.Errorf("Expected selectedIdx=30 (ID=1 at end), got %d", m.selectedIdx)
+	}
+}
