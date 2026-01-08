@@ -677,6 +677,160 @@ func TestMigrationFromOldSchema(t *testing.T) {
 	}
 }
 
+func TestMigrationWithAlterTableColumnOrder(t *testing.T) {
+	// Test that migration works when columns were added via ALTER TABLE,
+	// which puts them at the end of the table (different from CREATE TABLE order)
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "altered.db")
+
+	// Create a very old schema WITHOUT prompt and retry_count columns
+	oldSchema := `
+		CREATE TABLE repos (
+			id INTEGER PRIMARY KEY,
+			root_path TEXT UNIQUE NOT NULL,
+			name TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE TABLE commits (
+			id INTEGER PRIMARY KEY,
+			repo_id INTEGER NOT NULL REFERENCES repos(id),
+			sha TEXT UNIQUE NOT NULL,
+			author TEXT NOT NULL,
+			subject TEXT NOT NULL,
+			timestamp TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE TABLE review_jobs (
+			id INTEGER PRIMARY KEY,
+			repo_id INTEGER NOT NULL REFERENCES repos(id),
+			commit_id INTEGER REFERENCES commits(id),
+			git_ref TEXT NOT NULL,
+			agent TEXT NOT NULL DEFAULT 'codex',
+			status TEXT NOT NULL CHECK(status IN ('queued','running','done','failed')) DEFAULT 'queued',
+			enqueued_at TEXT NOT NULL DEFAULT (datetime('now')),
+			started_at TEXT,
+			finished_at TEXT,
+			worker_id TEXT,
+			error TEXT
+		);
+		CREATE TABLE reviews (
+			id INTEGER PRIMARY KEY,
+			job_id INTEGER UNIQUE NOT NULL REFERENCES review_jobs(id),
+			agent TEXT NOT NULL,
+			prompt TEXT NOT NULL,
+			output TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			addressed INTEGER NOT NULL DEFAULT 0
+		);
+		CREATE TABLE responses (
+			id INTEGER PRIMARY KEY,
+			commit_id INTEGER NOT NULL REFERENCES commits(id),
+			responder TEXT NOT NULL,
+			response TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+	`
+
+	rawDB, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)")
+	if err != nil {
+		t.Fatalf("Failed to open raw DB: %v", err)
+	}
+
+	if _, err := rawDB.Exec(oldSchema); err != nil {
+		rawDB.Close()
+		t.Fatalf("Failed to create old schema: %v", err)
+	}
+
+	// Add columns via ALTER TABLE - this puts them at the END of the table,
+	// not in the position they appear in the current CREATE TABLE schema
+	_, err = rawDB.Exec(`ALTER TABLE review_jobs ADD COLUMN prompt TEXT`)
+	if err != nil {
+		rawDB.Close()
+		t.Fatalf("Failed to add prompt column: %v", err)
+	}
+	_, err = rawDB.Exec(`ALTER TABLE review_jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`)
+	if err != nil {
+		rawDB.Close()
+		t.Fatalf("Failed to add retry_count column: %v", err)
+	}
+
+	// Insert test data with values for the altered columns
+	_, err = rawDB.Exec(`
+		INSERT INTO repos (id, root_path, name) VALUES (1, '/tmp/altered', 'altered');
+		INSERT INTO commits (id, repo_id, sha, author, subject, timestamp)
+			VALUES (1, 1, 'alter123', 'Author', 'Subject', '2024-01-01');
+		INSERT INTO review_jobs (id, repo_id, commit_id, git_ref, agent, status, enqueued_at, prompt, retry_count)
+			VALUES (1, 1, 1, 'alter123', 'codex', 'done', '2024-01-01', 'my prompt', 2);
+		INSERT INTO reviews (id, job_id, agent, prompt, output)
+			VALUES (1, 1, 'codex', 'test prompt', 'test output');
+	`)
+	if err != nil {
+		rawDB.Close()
+		t.Fatalf("Failed to insert test data: %v", err)
+	}
+	rawDB.Close()
+
+	// Open with our Open() function - should trigger CHECK constraint migration
+	// This tests that the explicit column naming in INSERT works correctly
+	// even when column order differs from schema definition
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() failed after migration: %v", err)
+	}
+	defer db.Close()
+
+	// Verify job data is preserved with correct values
+	job, err := db.GetJobByID(1)
+	if err != nil {
+		t.Fatalf("GetJobByID failed: %v", err)
+	}
+	if job.GitRef != "alter123" {
+		t.Errorf("Expected git_ref 'alter123', got '%s'", job.GitRef)
+	}
+	if job.Agent != "codex" {
+		t.Errorf("Expected agent 'codex', got '%s'", job.Agent)
+	}
+
+	// Verify retry_count was preserved (query directly since GetJobByID doesn't load it)
+	var retryCount int
+	err = db.QueryRow(`SELECT retry_count FROM review_jobs WHERE id = 1`).Scan(&retryCount)
+	if err != nil {
+		t.Fatalf("Failed to query retry_count: %v", err)
+	}
+	if retryCount != 2 {
+		t.Errorf("Expected retry_count 2, got %d", retryCount)
+	}
+
+	// Verify prompt was preserved
+	var prompt string
+	err = db.QueryRow(`SELECT prompt FROM review_jobs WHERE id = 1`).Scan(&prompt)
+	if err != nil {
+		t.Fatalf("Failed to query prompt: %v", err)
+	}
+	if prompt != "my prompt" {
+		t.Errorf("Expected prompt 'my prompt', got '%s'", prompt)
+	}
+
+	// Verify review data is preserved
+	review, err := db.GetReviewByJobID(1)
+	if err != nil {
+		t.Fatalf("GetReviewByJobID failed: %v", err)
+	}
+	if review.Output != "test output" {
+		t.Errorf("Expected output 'test output', got '%s'", review.Output)
+	}
+
+	// Verify new constraint works
+	repo, _ := db.GetOrCreateRepo("/tmp/test2")
+	commit, _ := db.GetOrCreateCommit(repo.ID, "newsha", "A", "S", time.Now())
+	newJob, _ := db.EnqueueJob(repo.ID, commit.ID, "newsha", "codex")
+	db.ClaimJob("worker-1")
+	err = db.CancelJob(newJob.ID)
+	if err != nil {
+		t.Fatalf("CancelJob failed after migration: %v", err)
+	}
+}
+
 func openTestDB(t *testing.T) *DB {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
