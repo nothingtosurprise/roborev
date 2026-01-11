@@ -12,12 +12,18 @@ import (
 func parseVerdict(output string) string {
 	for _, line := range strings.Split(output, "\n") {
 		trimmed := strings.TrimSpace(strings.ToLower(line))
+		// Normalize curly apostrophes to straight apostrophes (LLMs sometimes use these)
+		trimmed = strings.ReplaceAll(trimmed, "\u2018", "'") // left single quote
+		trimmed = strings.ReplaceAll(trimmed, "\u2019", "'") // right single quote
 		// Strip leading list markers (bullets, numbers, etc.)
 		trimmed = stripListMarker(trimmed)
 
 		// Check for pass indicators at start of line
 		isPass := strings.HasPrefix(trimmed, "no issues") ||
-			strings.HasPrefix(trimmed, "no findings")
+			strings.HasPrefix(trimmed, "no findings") ||
+			strings.HasPrefix(trimmed, "i didn't find any issues") ||
+			strings.HasPrefix(trimmed, "i did not find any issues") ||
+			strings.HasPrefix(trimmed, "i found no issues")
 
 		if isPass {
 			// Reject if line contains caveats (check for word boundaries)
@@ -62,6 +68,7 @@ func hasCaveat(s string) bool {
 	normalized = strings.ReplaceAll(normalized, "—", "|")
 	normalized = strings.ReplaceAll(normalized, "–", "|")
 	normalized = strings.ReplaceAll(normalized, ";", "|")
+	normalized = strings.ReplaceAll(normalized, ", ", "|")
 	normalized = strings.ReplaceAll(normalized, ". ", "|")
 	normalized = strings.ReplaceAll(normalized, "? ", "|")
 	normalized = strings.ReplaceAll(normalized, "! ", "|")
@@ -77,8 +84,179 @@ func hasCaveat(s string) bool {
 
 // checkClauseForCaveat checks a single clause for caveats
 func checkClauseForCaveat(clause string) bool {
-	// Normalize remaining punctuation
+	// Normalize punctuation and collapse whitespace
 	normalized := strings.ReplaceAll(clause, ",", " ")
+	normalized = strings.ReplaceAll(normalized, ":", " ")
+	// Collapse multiple spaces to single space
+	for strings.Contains(normalized, "  ") {
+		normalized = strings.ReplaceAll(normalized, "  ", " ")
+	}
+	normalized = strings.TrimSpace(normalized)
+	lc := strings.ToLower(normalized)
+
+	// Benign phrases that contain issue keywords but aren't actual issues
+	benignPhrases := []string{
+		"problem statement", "problem domain", "problem space", "problem definition",
+		"issue tracker", "issue tracking", "issue number", "issue #",
+		"vulnerability disclosure", "vulnerability report", "vulnerability scan",
+	}
+	for _, bp := range benignPhrases {
+		if strings.Contains(lc, bp) {
+			// Remove benign phrase to avoid false positives
+			lc = strings.ReplaceAll(lc, bp, "")
+		}
+	}
+
+	// Check for "found <issue>" pattern - handle both mid-clause and start-of-clause
+	issueKeywords := []string{
+		"issue", "issues", "bug", "bugs", "error", "errors",
+		"crash", "crashes", "panic", "panics", "fail", "failure", "failures",
+		"break", "breaks", "race", "races", "problem", "problems",
+		"vulnerability", "vulnerabilities",
+	}
+	quantifiers := []string{"", "a ", "an ", "the ", "some ", "multiple ", "several ", "many ", "a few ", "few ", "two ", "three ", "various ", "numerous "}
+	adjectives := []string{"", "critical ", "severe ", "serious ", "major ", "minor ", "potential ", "possible ", "obvious ", "subtle ", "important ", "significant "}
+
+	// Check for "found" at start of clause
+	if strings.HasPrefix(lc, "found ") {
+		afterFound := lc[6:]
+		if !strings.HasPrefix(afterFound, "no ") && !strings.HasPrefix(afterFound, "none") &&
+			!strings.HasPrefix(afterFound, "nothing") && !strings.HasPrefix(afterFound, "0 ") &&
+			!strings.HasPrefix(afterFound, "zero ") && !strings.HasPrefix(afterFound, "without ") {
+			for _, kw := range issueKeywords {
+				for _, q := range quantifiers {
+					for _, adj := range adjectives {
+						if strings.HasPrefix(afterFound, q+adj+kw) {
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Check for " found " mid-clause
+	remaining := lc
+	for {
+		idx := strings.Index(remaining, " found ")
+		if idx < 0 {
+			break
+		}
+		afterFound := remaining[idx+7:]
+		remaining = afterFound
+
+		isNegated := strings.HasPrefix(afterFound, "no ") ||
+			strings.HasPrefix(afterFound, "none") ||
+			strings.HasPrefix(afterFound, "nothing") ||
+			strings.HasPrefix(afterFound, "0 ") ||
+			strings.HasPrefix(afterFound, "zero ") ||
+			strings.HasPrefix(afterFound, "without ")
+		if isNegated {
+			continue
+		}
+
+		for _, kw := range issueKeywords {
+			for _, q := range quantifiers {
+				for _, adj := range adjectives {
+					if strings.HasPrefix(afterFound, q+adj+kw) {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	// Check for contextual issue/problem/vulnerability patterns
+	// Only match if not negated (not preceded by "no ")
+	contextualPatterns := []string{
+		"there are issue", "there are problem", "there is a issue", "there is a problem",
+		"there is an issue", "there are vulnerabilit",
+		"issues remain", "problems remain", "vulnerabilities remain",
+		"issues exist", "problems exist", "vulnerabilities exist",
+		"has issue", "has problem", "have issue", "have problem",
+		"has issues", "has problems", "have issues", "have problems",
+		"has vulnerabilit", "have vulnerabilit",
+	}
+	// Negators must appear near the pattern (within last 3 words, allowing adjectives)
+	contextNegators := []string{"no", "don't", "doesn't"}
+	for _, pattern := range contextualPatterns {
+		if idx := strings.Index(lc, pattern); idx >= 0 {
+			// Check if preceded by negation within last few words
+			start := idx - 30
+			if start < 0 {
+				start = 0
+			}
+			prefix := strings.TrimSpace(lc[start:idx])
+			if !hasNegatorInLastWords(prefix, contextNegators, 3) {
+				return true
+			}
+		}
+	}
+	// Check "issues/problems with/in" but only if not negated
+	withInPatterns := []string{"issues with", "problems with", "issue with", "problem with",
+		"issues in", "problems in", "issue in", "problem in"}
+	// Simple negators that work as single tokens
+	withInNegators := []string{"no", "didn't"}
+	for _, pattern := range withInPatterns {
+		if idx := strings.Index(lc, pattern); idx >= 0 {
+			// Check if preceded by negation within last few words
+			start := idx - 30
+			if start < 0 {
+				start = 0
+			}
+			prefix := strings.TrimSpace(lc[start:idx])
+			isNegated := hasNegatorInLastWords(prefix, withInNegators, 4)
+			if !isNegated {
+				// Check for "not" followed by verb in last few words
+				isNegated = hasNotVerbPattern(prefix)
+			}
+			if !isNegated {
+				return true
+			}
+		}
+	}
+
+	// Check if clause describes what was checked (not findings)
+	// e.g., "I checked for bugs, security issues..."
+	hasCheckPhrase := strings.Contains(lc, "checked for") ||
+		strings.Contains(lc, "looking for") ||
+		strings.Contains(lc, "looked for") ||
+		strings.Contains(lc, "searching for") ||
+		strings.Contains(lc, "searched for")
+
+	if hasCheckPhrase {
+		// Check for "still <issue>" pattern (e.g., "it still crashes")
+		if idx := strings.Index(lc, " still "); idx >= 0 {
+			afterStill := lc[idx+7:]
+			stillKeywords := []string{"crash", "panic", "fail", "break", "error", "bug"}
+			for _, kw := range stillKeywords {
+				if strings.HasPrefix(afterStill, kw) || strings.Contains(afterStill, " "+kw) {
+					return true
+				}
+			}
+		}
+
+		// Check for contrastive markers with issue words AFTER the marker
+		for _, marker := range []string{" however ", " but "} {
+			if idx := strings.Index(lc, marker); idx >= 0 {
+				tail := lc[idx+len(marker):]
+				if strings.Contains(tail, "crash") || strings.Contains(tail, "panic") ||
+					strings.Contains(tail, "error") || strings.Contains(tail, "bug") ||
+					strings.Contains(tail, "fail") || strings.Contains(tail, "break") ||
+					strings.Contains(tail, "race") || strings.Contains(tail, "issue") ||
+					strings.Contains(tail, "problem") || strings.Contains(tail, "vulnerabilit") {
+					// Make sure it's not negated like "found none"
+					if !strings.Contains(tail, "found none") && !strings.Contains(tail, "found nothing") &&
+						!strings.Contains(tail, "no ") && !strings.Contains(tail, "none") {
+						return true
+					}
+				}
+			}
+		}
+
+		// Check phrase with no findings - not a caveat
+		return false
+	}
 
 	words := strings.Fields(normalized)
 	for i, w := range words {
@@ -89,9 +267,12 @@ func checkClauseForCaveat(clause string) bool {
 			return true
 		}
 		// Negative indicators that suggest problems (unless negated)
+		// Note: "issue", "problem", "vulnerability" are too ambiguous for unconditional
+		// matching (e.g., "problem statement", "issue tracker", "vulnerability disclosure").
+		// They're handled in check-phrase context and contrast detection instead.
 		if w == "fail" || w == "fails" || w == "failed" || w == "failing" ||
 			w == "break" || w == "breaks" || w == "broken" ||
-			w == "crash" || w == "crashes" || w == "panic" ||
+			w == "crash" || w == "crashes" || w == "panic" || w == "panics" ||
 			w == "error" || w == "errors" || w == "bug" || w == "bugs" {
 			// Check if preceded by negation within this clause
 			if isNegated(words, i) {
@@ -148,6 +329,78 @@ func isNegated(words []string, i int) bool {
 			}
 			return true
 		}
+	}
+	return false
+}
+
+// hasNegatorInLastWords checks if any negator appears in the last n words of the prefix.
+// This allows adjectives between negator and pattern (e.g., "no significant issues").
+// Stops at clause boundaries (punctuation like comma, semicolon).
+func hasNegatorInLastWords(prefix string, negators []string, n int) bool {
+	words := strings.Fields(prefix)
+	if len(words) == 0 {
+		return false
+	}
+	// Check last n words, but stop at clause boundaries
+	checked := 0
+	for i := len(words) - 1; i >= 0 && checked < n; i-- {
+		raw := words[i]
+		// Stop at clause boundaries (words ending with comma, semicolon, etc.)
+		if strings.ContainsAny(raw, ",;:") {
+			break
+		}
+		w := strings.Trim(raw, ".,;:!?()[]\"'")
+		for _, neg := range negators {
+			if w == neg {
+				return true
+			}
+		}
+		checked++
+	}
+	return false
+}
+
+// hasNotVerbPattern checks if the last few words contain negation followed by a verb like "find".
+// Handles: "did not find", "not finding", "can't find", "cannot find", "couldn't find".
+func hasNotVerbPattern(prefix string) bool {
+	words := strings.Fields(prefix)
+	if len(words) < 2 {
+		return false
+	}
+	verbs := []string{"find", "finding", "found", "see", "seeing", "detect", "detecting", "have"}
+	// Contractions that imply "not" - only can't/cannot/couldn't which express inability
+	// Excludes won't/wouldn't which are often conditional ("wouldn't have issues if...")
+	contractions := map[string]bool{
+		"can't": true, "cant": true, "cannot": true,
+		"couldn't": true, "couldnt": true,
+	}
+	// Only check last 5 words, stop at clause boundaries
+	checked := 0
+	for i := len(words) - 1; i >= 1 && checked < 5; i-- {
+		raw := words[i]
+		if strings.ContainsAny(raw, ",;:") {
+			break
+		}
+		w := strings.Trim(raw, ".,;:!?()[]\"'")
+		prevRaw := words[i-1]
+		prev := strings.Trim(prevRaw, ".,;:!?()[]\"'")
+		// Check for "not" followed by verb
+		if prev == "not" {
+			for _, v := range verbs {
+				if w == v {
+					return true
+				}
+			}
+		}
+		// Check for contraction followed by verb (e.g., "can't find", "couldn't see")
+		if contractions[prev] {
+			for _, v := range verbs {
+				if w == v {
+					return true
+				}
+			}
+		}
+		checked++
 	}
 	return false
 }

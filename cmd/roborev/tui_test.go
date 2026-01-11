@@ -46,9 +46,9 @@ func TestTUIFetchJobsError(t *testing.T) {
 	cmd := m.fetchJobs()
 	msg := cmd()
 
-	_, ok := msg.(tuiErrMsg)
+	_, ok := msg.(tuiJobsErrMsg)
 	if !ok {
-		t.Fatalf("Expected tuiErrMsg for 500, got %T: %v", msg, msg)
+		t.Fatalf("Expected tuiJobsErrMsg for 500, got %T: %v", msg, msg)
 	}
 }
 
@@ -385,9 +385,9 @@ func TestTUIHTTPTimeout(t *testing.T) {
 	cmd := m.fetchJobs()
 	msg := cmd()
 
-	_, ok := msg.(tuiErrMsg)
+	_, ok := msg.(tuiJobsErrMsg)
 	if !ok {
-		t.Fatalf("Expected tuiErrMsg for timeout, got %T: %v", msg, msg)
+		t.Fatalf("Expected tuiJobsErrMsg for timeout, got %T: %v", msg, msg)
 	}
 }
 
@@ -2518,6 +2518,7 @@ func TestTUINavigateDownTriggersLoadMore(t *testing.T) {
 	m.selectedJobID = 1
 	m.hasMore = true
 	m.loadingMore = false
+	m.loadingJobs = false // Must be false to allow pagination
 	m.currentView = tuiViewQueue
 
 	// Press down at bottom - should trigger load more
@@ -2591,6 +2592,7 @@ func TestTUIResizeTriggersRefetchWhenNeeded(t *testing.T) {
 	m.jobs = []storage.ReviewJob{{ID: 1}, {ID: 2}, {ID: 3}}
 	m.hasMore = true
 	m.loadingMore = false
+	m.loadingJobs = false // Must be false to allow refetch
 	m.heightDetected = false
 	m.height = 24 // Default height
 
@@ -2650,6 +2652,7 @@ func TestTUIResizeRefetchOnLaterResize(t *testing.T) {
 	m.jobs = []storage.ReviewJob{{ID: 1}, {ID: 2}, {ID: 3}}
 	m.hasMore = true
 	m.loadingMore = false
+	m.loadingJobs = false // Must be false to allow refetch
 	m.heightDetected = true
 	m.height = 30
 
@@ -2665,5 +2668,407 @@ func TestTUIResizeRefetchOnLaterResize(t *testing.T) {
 	// Should trigger a re-fetch because terminal can show more jobs than we have
 	if cmd == nil {
 		t.Error("Should return fetchJobs command when terminal grows and can show more jobs")
+	}
+
+	// loadingJobs should be set
+	if !m2.loadingJobs {
+		t.Error("loadingJobs should be true after resize triggers fetch")
+	}
+}
+
+func TestTUIResizeNoRefetchWhileLoadingJobs(t *testing.T) {
+	m := newTuiModel("http://localhost")
+
+	// Set up with few jobs, but loadingJobs is already true (fetch in progress)
+	m.jobs = []storage.ReviewJob{{ID: 1}, {ID: 2}, {ID: 3}}
+	m.hasMore = true
+	m.loadingMore = false
+	m.loadingJobs = true // Already fetching
+	m.heightDetected = true
+	m.height = 30
+
+	// Simulate terminal growing larger
+	updated, cmd := m.Update(tea.WindowSizeMsg{Width: 120, Height: 80})
+	m2 := updated.(tuiModel)
+
+	if m2.height != 80 {
+		t.Errorf("Expected height 80, got %d", m2.height)
+	}
+
+	// Should NOT trigger another fetch because loadingJobs is true
+	if cmd != nil {
+		t.Error("Should not return command when loadingJobs is true (fetch already in progress)")
+	}
+}
+
+func TestTUITickNoRefreshWhileLoadingJobs(t *testing.T) {
+	m := newTuiModel("http://localhost")
+
+	// Set up with loadingJobs true
+	m.jobs = []storage.ReviewJob{{ID: 1}, {ID: 2}, {ID: 3}}
+	m.loadingJobs = true
+
+	// Simulate tick
+	updated, _ := m.Update(tuiTickMsg(time.Now()))
+	m2 := updated.(tuiModel)
+
+	// loadingJobs should still be true (not reset by tick)
+	if !m2.loadingJobs {
+		t.Error("loadingJobs should remain true when tick skips refresh")
+	}
+}
+
+func TestTUIJobsMsgClearsLoadingJobs(t *testing.T) {
+	m := newTuiModel("http://localhost")
+
+	// Set up with loadingJobs true
+	m.loadingJobs = true
+
+	// Simulate jobs response (not append)
+	updated, _ := m.Update(tuiJobsMsg{
+		jobs:    []storage.ReviewJob{{ID: 1}},
+		hasMore: false,
+		append:  false,
+	})
+	m2 := updated.(tuiModel)
+
+	// loadingJobs should be cleared
+	if m2.loadingJobs {
+		t.Error("loadingJobs should be false after non-append JobsMsg")
+	}
+}
+
+func TestTUIJobsMsgAppendKeepsLoadingJobs(t *testing.T) {
+	m := newTuiModel("http://localhost")
+
+	// Set up with loadingJobs true (shouldn't normally happen with append, but test the logic)
+	m.jobs = []storage.ReviewJob{{ID: 1}}
+	m.loadingJobs = true
+
+	// Simulate jobs response (append mode - pagination)
+	updated, _ := m.Update(tuiJobsMsg{
+		jobs:    []storage.ReviewJob{{ID: 2}},
+		hasMore: false,
+		append:  true,
+	})
+	m2 := updated.(tuiModel)
+
+	// loadingJobs should NOT be cleared by append (it's for pagination, not full refresh)
+	if !m2.loadingJobs {
+		t.Error("loadingJobs should remain true after append JobsMsg")
+	}
+}
+
+func TestTUIHideAddressedToggle(t *testing.T) {
+	m := newTuiModel("http://localhost")
+	m.currentView = tuiViewQueue
+
+	// Initial state: hideAddressed is false
+	if m.hideAddressed {
+		t.Error("hideAddressed should be false initially")
+	}
+
+	// Press 'h' to toggle
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	m2 := updated.(tuiModel)
+
+	if !m2.hideAddressed {
+		t.Error("hideAddressed should be true after pressing 'h'")
+	}
+
+	// Press 'h' again to toggle back
+	updated, _ = m2.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	m3 := updated.(tuiModel)
+
+	if m3.hideAddressed {
+		t.Error("hideAddressed should be false after pressing 'h' again")
+	}
+}
+
+func TestTUIHideAddressedFiltersJobs(t *testing.T) {
+	m := newTuiModel("http://localhost")
+	m.currentView = tuiViewQueue
+	m.hideAddressed = true
+
+	addressedTrue := true
+	addressedFalse := false
+	m.jobs = []storage.ReviewJob{
+		{ID: 1, Status: storage.JobStatusDone, Addressed: &addressedTrue},  // hidden: addressed
+		{ID: 2, Status: storage.JobStatusDone, Addressed: &addressedFalse}, // visible
+		{ID: 3, Status: storage.JobStatusFailed},                           // hidden: failed
+		{ID: 4, Status: storage.JobStatusCanceled},                         // hidden: canceled
+		{ID: 5, Status: storage.JobStatusDone, Addressed: &addressedFalse}, // visible
+	}
+
+	// Check visibility
+	if m.isJobVisible(m.jobs[0]) {
+		t.Error("Addressed job should be hidden")
+	}
+	if !m.isJobVisible(m.jobs[1]) {
+		t.Error("Non-addressed job should be visible")
+	}
+	if m.isJobVisible(m.jobs[2]) {
+		t.Error("Failed job should be hidden")
+	}
+	if m.isJobVisible(m.jobs[3]) {
+		t.Error("Canceled job should be hidden")
+	}
+	if !m.isJobVisible(m.jobs[4]) {
+		t.Error("Non-addressed job should be visible")
+	}
+
+	// getVisibleJobs should only return 2 jobs
+	visible := m.getVisibleJobs()
+	if len(visible) != 2 {
+		t.Errorf("Expected 2 visible jobs, got %d", len(visible))
+	}
+	if visible[0].ID != 2 || visible[1].ID != 5 {
+		t.Errorf("Expected visible jobs 2 and 5, got %d and %d", visible[0].ID, visible[1].ID)
+	}
+}
+
+func TestTUIHideAddressedSelectionMovesToVisible(t *testing.T) {
+	m := newTuiModel("http://localhost")
+	m.currentView = tuiViewQueue
+
+	addressedTrue := true
+	addressedFalse := false
+	m.jobs = []storage.ReviewJob{
+		{ID: 1, Status: storage.JobStatusDone, Addressed: &addressedTrue},  // will be hidden
+		{ID: 2, Status: storage.JobStatusDone, Addressed: &addressedFalse}, // will be visible
+		{ID: 3, Status: storage.JobStatusDone, Addressed: &addressedFalse}, // will be visible
+	}
+
+	// Select the first job (addressed)
+	m.selectedIdx = 0
+	m.selectedJobID = 1
+
+	// Toggle hide addressed
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	m2 := updated.(tuiModel)
+
+	// Selection should move to first visible job (ID=2)
+	if m2.selectedIdx != 1 {
+		t.Errorf("Expected selectedIdx=1, got %d", m2.selectedIdx)
+	}
+	if m2.selectedJobID != 2 {
+		t.Errorf("Expected selectedJobID=2, got %d", m2.selectedJobID)
+	}
+}
+
+func TestTUIHideAddressedRefreshRevalidatesSelection(t *testing.T) {
+	m := newTuiModel("http://localhost")
+	m.currentView = tuiViewQueue
+	m.hideAddressed = true
+
+	addressedFalse := false
+	m.jobs = []storage.ReviewJob{
+		{ID: 1, Status: storage.JobStatusDone, Addressed: &addressedFalse},
+		{ID: 2, Status: storage.JobStatusDone, Addressed: &addressedFalse},
+	}
+	m.selectedIdx = 0
+	m.selectedJobID = 1
+
+	// Simulate jobs refresh where job 1 is now addressed
+	addressedTrue := true
+	updated, _ := m.Update(tuiJobsMsg{
+		jobs: []storage.ReviewJob{
+			{ID: 1, Status: storage.JobStatusDone, Addressed: &addressedTrue},  // now addressed (hidden)
+			{ID: 2, Status: storage.JobStatusDone, Addressed: &addressedFalse}, // still visible
+		},
+		hasMore: false,
+	})
+	m2 := updated.(tuiModel)
+
+	// Selection should move to job 2 since job 1 is now hidden
+	if m2.selectedJobID != 2 {
+		t.Errorf("Expected selectedJobID=2, got %d", m2.selectedJobID)
+	}
+	if m2.selectedIdx != 1 {
+		t.Errorf("Expected selectedIdx=1, got %d", m2.selectedIdx)
+	}
+}
+
+func TestTUIHideAddressedNavigationSkipsHidden(t *testing.T) {
+	m := newTuiModel("http://localhost")
+	m.currentView = tuiViewQueue
+	m.hideAddressed = true
+
+	addressedTrue := true
+	addressedFalse := false
+	m.jobs = []storage.ReviewJob{
+		{ID: 1, Status: storage.JobStatusDone, Addressed: &addressedFalse}, // visible
+		{ID: 2, Status: storage.JobStatusDone, Addressed: &addressedTrue},  // hidden
+		{ID: 3, Status: storage.JobStatusFailed},                           // hidden
+		{ID: 4, Status: storage.JobStatusDone, Addressed: &addressedFalse}, // visible
+	}
+	m.selectedIdx = 0
+	m.selectedJobID = 1
+
+	// Navigate down - should skip jobs 2 and 3
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m2 := updated.(tuiModel)
+
+	if m2.selectedJobID != 4 {
+		t.Errorf("Expected selectedJobID=4, got %d", m2.selectedJobID)
+	}
+	if m2.selectedIdx != 3 {
+		t.Errorf("Expected selectedIdx=3, got %d", m2.selectedIdx)
+	}
+}
+
+func TestTUIHideAddressedWithRepoFilter(t *testing.T) {
+	m := newTuiModel("http://localhost")
+	m.currentView = tuiViewQueue
+	m.hideAddressed = true
+	m.activeRepoFilter = "/repo/a"
+
+	addressedTrue := true
+	addressedFalse := false
+	m.jobs = []storage.ReviewJob{
+		{ID: 1, RepoPath: "/repo/a", Status: storage.JobStatusDone, Addressed: &addressedFalse}, // visible: matches repo, not addressed
+		{ID: 2, RepoPath: "/repo/b", Status: storage.JobStatusDone, Addressed: &addressedFalse}, // hidden: wrong repo
+		{ID: 3, RepoPath: "/repo/a", Status: storage.JobStatusDone, Addressed: &addressedTrue},  // hidden: addressed
+		{ID: 4, RepoPath: "/repo/a", Status: storage.JobStatusFailed},                           // hidden: failed
+	}
+
+	// Only job 1 should be visible
+	visible := m.getVisibleJobs()
+	if len(visible) != 1 {
+		t.Errorf("Expected 1 visible job, got %d", len(visible))
+	}
+	if visible[0].ID != 1 {
+		t.Errorf("Expected visible job ID=1, got %d", visible[0].ID)
+	}
+}
+
+func TestTUIAddressedToggleMovesSelectionWithHideActive(t *testing.T) {
+	m := newTuiModel("http://localhost")
+	m.currentView = tuiViewQueue
+	m.hideAddressed = true
+
+	addressedFalse := false
+	m.jobs = []storage.ReviewJob{
+		{ID: 1, Status: storage.JobStatusDone, Addressed: &addressedFalse},
+		{ID: 2, Status: storage.JobStatusDone, Addressed: &addressedFalse},
+		{ID: 3, Status: storage.JobStatusDone, Addressed: &addressedFalse},
+	}
+	m.selectedIdx = 1
+	m.selectedJobID = 2
+
+	// Simulate marking job 2 as addressed
+	addressedTrue := true
+	m.jobs[1].Addressed = &addressedTrue
+
+	// Verify job 2 is now hidden
+	if m.isJobVisible(m.jobs[1]) {
+		t.Error("Job 2 should be hidden after marking as addressed")
+	}
+
+	// Simulate what happens in 'a' handler - selection should move
+	// Since job 2 is now hidden, find next visible
+	nextIdx := m.findNextVisibleJob(m.selectedIdx)
+	if nextIdx != 2 {
+		t.Errorf("Expected next visible job at index 2, got %d", nextIdx)
+	}
+}
+
+func TestTUINewModelLoadingJobsTrue(t *testing.T) {
+	// newTuiModel should initialize loadingJobs to true since Init() calls fetchJobs
+	m := newTuiModel("http://localhost")
+	if !m.loadingJobs {
+		t.Error("loadingJobs should be true in new model")
+	}
+}
+
+func TestTUIJobsErrMsgClearsLoadingJobs(t *testing.T) {
+	m := newTuiModel("http://localhost")
+	m.loadingJobs = true
+
+	// Simulate job fetch error
+	updated, _ := m.Update(tuiJobsErrMsg{err: fmt.Errorf("connection refused")})
+	m2 := updated.(tuiModel)
+
+	if m2.loadingJobs {
+		t.Error("loadingJobs should be cleared on job fetch error")
+	}
+	if m2.err == nil {
+		t.Error("err should be set on job fetch error")
+	}
+}
+
+func TestTUIPaginationBlockedWhileLoadingJobs(t *testing.T) {
+	m := newTuiModel("http://localhost")
+	m.currentView = tuiViewQueue
+	m.loadingJobs = true
+	m.hasMore = true
+	m.loadingMore = false
+
+	// Set up at last job
+	m.jobs = []storage.ReviewJob{{ID: 1}}
+	m.selectedIdx = 0
+	m.selectedJobID = 1
+
+	// Try to navigate down (would normally trigger pagination)
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m2 := updated.(tuiModel)
+
+	// Pagination should NOT be triggered because loadingJobs is true
+	if m2.loadingMore {
+		t.Error("loadingMore should not be set while loadingJobs is true")
+	}
+	if cmd != nil {
+		t.Error("No command should be returned when pagination is blocked")
+	}
+}
+
+func TestTUIPaginationAllowedWhenNotLoadingJobs(t *testing.T) {
+	m := newTuiModel("http://localhost")
+	m.currentView = tuiViewQueue
+	m.loadingJobs = false
+	m.hasMore = true
+	m.loadingMore = false
+
+	// Set up at last job
+	m.jobs = []storage.ReviewJob{{ID: 1}}
+	m.selectedIdx = 0
+	m.selectedJobID = 1
+
+	// Navigate down - should trigger pagination
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m2 := updated.(tuiModel)
+
+	// Pagination SHOULD be triggered
+	if !m2.loadingMore {
+		t.Error("loadingMore should be set when pagination is allowed")
+	}
+	if cmd == nil {
+		t.Error("Command should be returned to fetch more jobs")
+	}
+}
+
+func TestTUIPageDownBlockedWhileLoadingJobs(t *testing.T) {
+	m := newTuiModel("http://localhost")
+	m.currentView = tuiViewQueue
+	m.loadingJobs = true
+	m.hasMore = true
+	m.loadingMore = false
+	m.height = 30
+
+	// Set up with one job
+	m.jobs = []storage.ReviewJob{{ID: 1}}
+	m.selectedIdx = 0
+	m.selectedJobID = 1
+
+	// Try pgdown (would normally trigger pagination at end)
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	m2 := updated.(tuiModel)
+
+	// Pagination should NOT be triggered
+	if m2.loadingMore {
+		t.Error("loadingMore should not be set on pgdown while loadingJobs is true")
+	}
+	if cmd != nil {
+		t.Error("No command should be returned when pagination is blocked")
 	}
 }
