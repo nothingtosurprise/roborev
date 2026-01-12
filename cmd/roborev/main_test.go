@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -539,6 +540,112 @@ func TestGenerateHookContent(t *testing.T) {
 				}
 				break
 			}
+		}
+	})
+}
+
+func TestEnqueueSkippedBranch(t *testing.T) {
+	// Override HOME to prevent reading real daemon.json
+	tmpHome := t.TempDir()
+	origHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpHome)
+	defer os.Setenv("HOME", origHome)
+
+	// Create a temp git repo
+	tmpDir := t.TempDir()
+	runGit := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = tmpDir
+		cmd.Env = append(os.Environ(),
+			"HOME="+tmpHome,
+			"GIT_AUTHOR_NAME=Test",
+			"GIT_AUTHOR_EMAIL=test@test.com",
+			"GIT_COMMITTER_NAME=Test",
+			"GIT_COMMITTER_EMAIL=test@test.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		}
+	}
+
+	runGit("init")
+	runGit("config", "user.email", "test@test.com")
+	runGit("config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(tmpDir, "file.txt"), []byte("content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "file.txt")
+	runGit("commit", "-m", "initial commit")
+
+	// Create mock server that returns skipped response
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/enqueue" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"skipped": true,
+				"reason":  "branch \"wip\" is excluded from reviews",
+			})
+			return
+		}
+		if r.URL.Path == "/api/status" {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"version": version.Version,
+			})
+			return
+		}
+	}))
+	defer ts.Close()
+
+	// Write fake daemon.json pointing to our mock server
+	roborevDir := filepath.Join(tmpHome, ".roborev")
+	if err := os.MkdirAll(roborevDir, 0755); err != nil {
+		t.Fatalf("Failed to create roborev dir: %v", err)
+	}
+	mockAddr := ts.URL[7:] // remove "http://"
+	daemonInfo := daemon.RuntimeInfo{Addr: mockAddr, PID: os.Getpid(), Version: version.Version}
+	data, err := json.Marshal(daemonInfo)
+	if err != nil {
+		t.Fatalf("Failed to marshal daemon info: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(roborevDir, "daemon.json"), data, 0644); err != nil {
+		t.Fatalf("Failed to write daemon.json: %v", err)
+	}
+
+	t.Run("skipped response prints message and exits successfully", func(t *testing.T) {
+		serverAddr = ts.URL
+
+		var stdout bytes.Buffer
+		cmd := enqueueCmd()
+		cmd.SetOut(&stdout)
+		cmd.SetArgs([]string{"--repo", tmpDir})
+		err := cmd.Execute()
+		if err != nil {
+			t.Errorf("enqueue should succeed (exit 0) for skipped branch, got error: %v", err)
+		}
+
+		output := stdout.String()
+		if !strings.Contains(output, "Skipped") {
+			t.Errorf("expected output to contain 'Skipped', got: %q", output)
+		}
+	})
+
+	t.Run("skipped response in quiet mode suppresses output", func(t *testing.T) {
+		serverAddr = ts.URL
+
+		var stdout bytes.Buffer
+		cmd := enqueueCmd()
+		cmd.SetOut(&stdout)
+		cmd.SetArgs([]string{"--repo", tmpDir, "--quiet"})
+		err := cmd.Execute()
+		if err != nil {
+			t.Errorf("enqueue --quiet should succeed for skipped branch, got error: %v", err)
+		}
+
+		output := stdout.String()
+		if output != "" {
+			t.Errorf("expected no output in quiet mode, got: %q", output)
 		}
 	})
 }
