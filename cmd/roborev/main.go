@@ -581,6 +581,7 @@ func initCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&agent, "agent", "", "default agent (codex, claude-code, gemini, copilot, opencode, cursor)")
 	cmd.Flags().BoolVar(&noDaemon, "no-daemon", false, "skip auto-starting daemon (useful with systemd/launchd)")
+	registerAgentCompletion(cmd)
 
 	cmd.AddCommand(ghActionCmd())
 
@@ -1122,6 +1123,8 @@ Examples:
 	cmd.Flags().StringVar(&since, "since", "", "review commits since this commit (exclusive, like git's .. range)")
 	cmd.Flags().BoolVar(&local, "local", false, "run review locally without daemon (streams output to console)")
 	cmd.Flags().StringVar(&reviewType, "type", "", "review type (security, design) — changes system prompt")
+	registerAgentCompletion(cmd)
+	registerReasoningCompletion(cmd)
 
 	return cmd
 }
