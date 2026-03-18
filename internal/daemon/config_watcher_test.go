@@ -199,6 +199,7 @@ func TestConfigWatcher_NoConfigPath(t *testing.T) {
 }
 
 func TestConfigWatcher_Reloads(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name          string
 		initialConfig string
@@ -291,15 +292,16 @@ job_timeout_minutes = 30
 }
 
 func TestConfigWatcher_InvalidConfigDoesNotCrash(t *testing.T) {
+	t.Parallel()
 	h := newConfigWatcherHarness(t, `default_agent = "test-agent"`)
 
 	// Write invalid TOML - this should not crash the watcher
 	h.updateConfig(t, `this is not valid toml [[[`)
 
-	// Wait for debounce and potential reload attempt (no event fired for failure)
+	// Wait for debounce (200ms) plus margin for the reload attempt (no event fired for failure)
 	requireNever(t, func() bool {
 		return h.Watcher.Config().DefaultAgent != "test-agent"
-	}, 500*time.Millisecond, 50*time.Millisecond)
+	}, 300*time.Millisecond, 50*time.Millisecond)
 
 	// Config should still be the original value
 	if h.Watcher.Config().DefaultAgent != "test-agent" {
@@ -372,6 +374,7 @@ func TestConfigWatcher_StartAfterStopErrors(t *testing.T) {
 }
 
 func TestConfigWatcher_ReloadCounter(t *testing.T) {
+	t.Parallel()
 	h := newConfigWatcherHarness(t, `default_agent = "v1"`)
 
 	// Initial counter should be 0
@@ -399,6 +402,7 @@ func TestConfigWatcher_ReloadCounter(t *testing.T) {
 }
 
 func TestConfigWatcher_AtomicSaveViaRename(t *testing.T) {
+	t.Parallel()
 	h := newConfigWatcherHarness(t, `default_agent = "original"`)
 
 	// Simulate atomic save: write to temp file then rename

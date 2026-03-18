@@ -49,6 +49,9 @@ func newCIPollerHarness(t *testing.T, identity string) *ciPollerHarness {
 	// agent binaries from the developer environment.
 	cfg.CI.SynthesisAgent = "test"
 	p := NewCIPoller(db, NewStaticConfig(cfg), nil)
+	// Default to assuming PR is open so tests don't shell out to `gh pr view`.
+	// Tests that need specific isPROpen behavior can override this.
+	p.isPROpenFn = func(string, int) bool { return true }
 	return &ciPollerHarness{DB: db, RepoPath: repo.RootPath, Repo: repo, Cfg: cfg, Poller: p}
 }
 
@@ -1026,6 +1029,7 @@ func TestCIPollerProcessPR_InvalidReasoning(t *testing.T) {
 }
 
 func TestCIPollerSynthesizeBatchResults_WithTestAgent(t *testing.T) {
+	t.Parallel()
 	cfg := config.DefaultConfig()
 	cfg.CI.SynthesisAgent = "test"
 
@@ -1051,6 +1055,7 @@ func TestCIPollerSynthesizeBatchResults_WithTestAgent(t *testing.T) {
 }
 
 func TestCIPollerSynthesizeBatchResults_UsesRepoPath(t *testing.T) {
+	t.Parallel()
 	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
 	h.Cfg.CI.SynthesisAgent = "test"
 	batch, job := h.seedBatchJob(t, "acme/api", 20, "sha", "a..b", "codex", "security")
@@ -1079,6 +1084,7 @@ func TestCIPollerSynthesizeBatchResults_UsesRepoPath(t *testing.T) {
 }
 
 func TestSynthesizeBatchResults_BackupOnPrimaryFailure(t *testing.T) {
+	t.Parallel()
 	cfg := config.DefaultConfig()
 	cfg.CI.SynthesisAgent = "nonexistent-primary-xyz"
 	cfg.CI.SynthesisBackupAgent = "test"
@@ -2619,6 +2625,7 @@ func TestCIPollerPostBatchResults_SetsErrorStatusOnAllFailed(t *testing.T) {
 }
 
 func TestCIPollerPostBatchResults_SetsFailureStatusOnMixedOutcome(t *testing.T) {
+	t.Parallel()
 	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
 
 	// Create a batch with 2 jobs (initially queued/empty status)
@@ -2670,6 +2677,7 @@ func TestCIPollerPostBatchResults_SetsFailureStatusOnMixedOutcome(t *testing.T) 
 }
 
 func TestCIPollerPostBatchResults_QuotaSkippedNotFailure(t *testing.T) {
+	t.Parallel()
 	h := newCIPollerHarness(t, "git@github.com:acme/api.git")
 
 	// One success, one quota-skipped
