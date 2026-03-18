@@ -630,49 +630,39 @@ func TestFixCmdFlagValidation(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name:    "--branch without --open",
-			args:    []string{"--branch", "main"},
-			wantErr: "--branch requires --open",
-		},
-		{
 			name:    "--all-branches with positional args",
 			args:    []string{"--all-branches", "123"},
-			wantErr: "--open cannot be used with positional job IDs",
+			wantErr: "--all-branches cannot be used with positional job IDs",
 		},
 		{
-			name:    "--open with positional args",
-			args:    []string{"--unaddressed", "123"},
-			wantErr: "--open cannot be used with positional job IDs",
+			name:    "--branch with positional args",
+			args:    []string{"--branch", "main", "123"},
+			wantErr: "--branch cannot be used with positional job IDs",
 		},
 		{
-			name:    "--newest-first without --open",
+			name:    "--newest-first with positional args",
 			args:    []string{"--newest-first", "123"},
-			wantErr: "--newest-first requires --open",
+			wantErr: "--newest-first cannot be used with positional job IDs",
 		},
 		{
-			name:    "--all-branches with --branch (no explicit --unaddressed)",
+			name:    "--all-branches with --branch",
 			args:    []string{"--all-branches", "--branch", "main"},
 			wantErr: "--all-branches and --branch are mutually exclusive",
 		},
 		{
-			name:    "--batch with --open",
-			args:    []string{"--batch", "--unaddressed"},
-			wantErr: "--batch and --open are mutually exclusive",
-		},
-		{
 			name:    "--batch with explicit IDs and --branch",
 			args:    []string{"--batch", "--branch", "main", "123"},
-			wantErr: "cannot be used with explicit job IDs",
+			wantErr: "--branch cannot be used with positional job IDs",
 		},
 		{
 			name:    "--batch with explicit IDs and --all-branches",
 			args:    []string{"--batch", "--all-branches", "123"},
-			wantErr: "cannot be used with explicit job IDs",
+			wantErr: "--all-branches cannot be used with positional job IDs",
 		},
 		{
 			name:    "--batch with explicit IDs and --newest-first",
 			args:    []string{"--batch", "--newest-first", "123"},
-			wantErr: "cannot be used with explicit job IDs",
+			wantErr: "--newest-first cannot be used with positional job IDs",
 		},
 		{
 			name:    "--list with positional args",
@@ -724,9 +714,9 @@ func TestFixNoArgsDefaultsToOpen(t *testing.T) {
 	assert.False(t, err != nil && strings.Contains(err.Error(), "requires at least"))
 }
 
-func TestFixAllBranchesImpliesOpen(t *testing.T) {
-	// --all-branches alone should imply --open and pass
-	// validation, routing through open discovery.
+func TestFixAllBranchesDiscovery(t *testing.T) {
+	// --all-branches alone should pass validation and
+	// route through open discovery.
 	daemonFromHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
 			"jobs":     []any{},
@@ -759,7 +749,7 @@ func TestRunFixOpen(t *testing.T) {
 			Build()
 
 		out, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
-			return runFixOpen(cmd, "", false, fixOptions{agentName: "test"})
+			return runFixOpen(cmd, "", false, false, false, fixOptions{agentName: "test"})
 		})
 		require.NoError(t, err, "runFixOpen")
 		assert.Contains(t, out, "No open jobs found")
@@ -810,7 +800,7 @@ func TestRunFixOpen(t *testing.T) {
 			Build()
 
 		out, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
-			return runFixOpen(cmd, "", false, fixOptions{agentName: "test", reasoning: "fast"})
+			return runFixOpen(cmd, "", false, false, false, fixOptions{agentName: "test", reasoning: "fast"})
 		})
 		require.NoError(t, err, "runFixOpen")
 		assert.Contains(t, out, "Found 2 open job(s)")
@@ -833,7 +823,7 @@ func TestRunFixOpen(t *testing.T) {
 			Build()
 
 		_, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
-			return runFixOpen(cmd, "feature-branch", false, fixOptions{agentName: "test"})
+			return runFixOpen(cmd, "feature-branch", false, true, false, fixOptions{agentName: "test"})
 		})
 		require.NoError(t, err, "runFixOpen")
 		assert.Equal(t, "feature-branch", gotBranch)
@@ -848,12 +838,156 @@ func TestRunFixOpen(t *testing.T) {
 			Build()
 
 		_, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
-			return runFixOpen(cmd, "", false, fixOptions{agentName: "test"})
+			return runFixOpen(cmd, "", false, false, false, fixOptions{agentName: "test"})
 		})
 		require.Error(t, err, "expected error on server failure")
 		assert.Contains(t, err.Error(), "server error")
 	})
+
+	t.Run("all-branches includes jobs from other branches", func(t *testing.T) {
+		// The repo is on its default branch (e.g. "master"). Jobs from
+		// "other-branch" should still be discovered when branch==""
+		// (all-branches mode) — filterReachableJobs must be skipped.
+		var reviewCalls atomic.Int32
+		var openQueryCalls atomic.Int32
+
+		_ = newMockDaemonBuilder(t).
+			WithHandler("/api/jobs", func(w http.ResponseWriter, r *http.Request) {
+				q := r.URL.Query()
+				if q.Get("closed") == "false" && q.Get("limit") == "0" {
+					// Verify no branch filter in the API query
+					assert.Empty(t, q.Get("branch"),
+						"all-branches should not send branch filter")
+					if openQueryCalls.Add(1) == 1 {
+						writeJSON(w, map[string]any{
+							"jobs": []storage.ReviewJob{
+								{
+									ID:     30,
+									Status: storage.JobStatusDone,
+									Agent:  "test",
+									Branch: "other-branch",
+									GitRef: "dirty",
+								},
+								{
+									ID:     31,
+									Status: storage.JobStatusDone,
+									Agent:  "test",
+									Branch: "yet-another",
+									GitRef: "dirty",
+								},
+							},
+							"has_more": false,
+						})
+					} else {
+						writeJSON(w, map[string]any{
+							"jobs":     []storage.ReviewJob{},
+							"has_more": false,
+						})
+					}
+				} else {
+					writeJSON(w, map[string]any{
+						"jobs": []storage.ReviewJob{
+							{ID: 30, Status: storage.JobStatusDone, Agent: "test"},
+						},
+						"has_more": false,
+					})
+				}
+			}).
+			WithHandler("/api/review", func(w http.ResponseWriter, r *http.Request) {
+				reviewCalls.Add(1)
+				writeJSON(w, storage.Review{Output: "findings"})
+			}).
+			WithHandler("/api/review/close", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}).
+			WithHandler("/api/enqueue", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}).
+			Build()
+
+		out, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
+			return runFixOpen(cmd, "", true, false, false, fixOptions{
+				agentName: "test",
+				reasoning: "fast",
+			})
+		})
+		require.NoError(t, err, "runFixOpen all-branches")
+		assert.Contains(t, out, "Found 2 open job(s)")
+		assert.GreaterOrEqual(t, reviewCalls.Load(), int32(2),
+			"should process jobs from other branches")
+	})
+
+	t.Run("explicit branch filters by branch field", func(t *testing.T) {
+		// When branch="target-branch", only jobs with that branch
+		// should survive filterReachableJobs (branchOnly path).
+		var reviewCalls atomic.Int32
+		var openQueryCalls atomic.Int32
+
+		_ = newMockDaemonBuilder(t).
+			WithHandler("/api/jobs", func(w http.ResponseWriter, r *http.Request) {
+				q := r.URL.Query()
+				if q.Get("closed") == "false" && q.Get("limit") == "0" {
+					assert.Equal(t, "target-branch", q.Get("branch"))
+					if openQueryCalls.Add(1) == 1 {
+						writeJSON(w, map[string]any{
+							"jobs": []storage.ReviewJob{
+								{
+									ID:     40,
+									Status: storage.JobStatusDone,
+									Agent:  "test",
+									Branch: "target-branch",
+									GitRef: "dirty",
+								},
+								{
+									ID:     41,
+									Status: storage.JobStatusDone,
+									Agent:  "test",
+									Branch: "wrong-branch",
+									GitRef: "dirty",
+								},
+							},
+							"has_more": false,
+						})
+					} else {
+						writeJSON(w, map[string]any{
+							"jobs":     []storage.ReviewJob{},
+							"has_more": false,
+						})
+					}
+				} else {
+					writeJSON(w, map[string]any{
+						"jobs": []storage.ReviewJob{
+							{ID: 40, Status: storage.JobStatusDone, Agent: "test"},
+						},
+						"has_more": false,
+					})
+				}
+			}).
+			WithHandler("/api/review", func(w http.ResponseWriter, r *http.Request) {
+				reviewCalls.Add(1)
+				writeJSON(w, storage.Review{Output: "findings"})
+			}).
+			WithHandler("/api/review/close", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}).
+			WithHandler("/api/enqueue", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}).
+			Build()
+
+		out, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
+			return runFixOpen(cmd, "target-branch", false, true, false, fixOptions{
+				agentName: "test",
+				reasoning: "fast",
+			})
+		})
+		require.NoError(t, err, "runFixOpen with explicit branch")
+		// Only job 40 matches; job 41 has wrong branch
+		assert.Contains(t, out, "Found 1 open job(s)")
+		assert.Equal(t, int32(1), reviewCalls.Load())
+	})
 }
+
 func TestRunFixOpenOrdering(t *testing.T) {
 	repo := createTestRepo(t, map[string]string{"f.txt": "x"})
 
@@ -908,7 +1042,7 @@ func TestRunFixOpenOrdering(t *testing.T) {
 		b.Build()
 
 		out, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
-			return runFixOpen(cmd, "", false, fixOptions{agentName: "test", reasoning: "fast"})
+			return runFixOpen(cmd, "", false, false, false, fixOptions{agentName: "test", reasoning: "fast"})
 		})
 		require.NoError(t, err)
 
@@ -920,7 +1054,7 @@ func TestRunFixOpenOrdering(t *testing.T) {
 		b.Build()
 
 		out, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
-			return runFixOpen(cmd, "", true, fixOptions{agentName: "test", reasoning: "fast"})
+			return runFixOpen(cmd, "", false, false, true, fixOptions{agentName: "test", reasoning: "fast"})
 		})
 		require.NoError(t, err)
 
@@ -986,7 +1120,7 @@ func TestRunFixOpenRequery(t *testing.T) {
 		Build()
 
 	out, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
-		return runFixOpen(cmd, "", false, fixOptions{agentName: "test", reasoning: "fast"})
+		return runFixOpen(cmd, "", false, false, false, fixOptions{agentName: "test", reasoning: "fast"})
 	})
 	require.NoError(t, err)
 
@@ -1080,7 +1214,7 @@ func TestRunFixOpenRecoversFromDaemonRestartOnRequery(t *testing.T) {
 		Build()
 
 	out, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
-		return runFixOpen(cmd, "", false, fixOptions{agentName: "test", reasoning: "fast"})
+		return runFixOpen(cmd, "", false, false, false, fixOptions{agentName: "test", reasoning: "fast"})
 	})
 	require.NoError(t, err)
 
@@ -1686,7 +1820,7 @@ func TestRunFixList(t *testing.T) {
 
 		// Check usage hints
 		assert.Contains(t, out, "roborev fix <job_id>")
-		assert.Contains(t, out, "roborev fix --open")
+		assert.Contains(t, out, "roborev fix\n")
 	})
 
 	t.Run("no open jobs", func(t *testing.T) {
@@ -1830,7 +1964,7 @@ func TestFixWorktreeRepoResolution(t *testing.T) {
 		var buf bytes.Buffer
 		cmd.SetOut(&buf)
 		opts := fixOptions{quiet: true}
-		if err := runFixOpen(cmd, "", false, opts); err != nil {
+		if err := runFixOpen(cmd, "", false, false, false, opts); err != nil {
 			require.NoError(t, err, "runFixOpen: %v")
 		}
 
@@ -1848,7 +1982,7 @@ func TestFixWorktreeRepoResolution(t *testing.T) {
 		cmd.SetOut(&buf)
 		opts := fixOptions{quiet: true}
 		// nil jobIDs triggers discovery via queryOpenJobs
-		if err := runFixBatch(cmd, nil, "", false, opts); err != nil {
+		if err := runFixBatch(cmd, nil, "", false, false, false, opts); err != nil {
 			require.NoError(t, err, "runFixBatch: %v")
 		}
 
@@ -2044,7 +2178,7 @@ func TestFixBatchSkipsPassVerdict(t *testing.T) {
 			cmd,
 			[]int64{10, 20},
 			"",
-			false,
+			false, false, false,
 			fixOptions{agentName: "test", reasoning: "fast"},
 		)
 	})
@@ -2886,9 +3020,13 @@ func TestRunFixOpenFiltersUnreachableJobs(t *testing.T) {
 		}).
 		Build()
 
+	// Pass the worktree's branch for API query filtering, matching what
+	// the CLI does when neither --all-branches nor --branch is set
+	// (effectiveBranch is resolved to the current branch). allBranches
+	// is false, so filterReachableJobs uses commit-graph reachability.
 	_, runErr := runWithOutput(t, worktreeDir, func(cmd *cobra.Command) error {
 		return runFixOpen(
-			cmd, "", false,
+			cmd, "wt-branch", false, false, false,
 			fixOptions{agentName: "test", reasoning: "fast"},
 		)
 	})

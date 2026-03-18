@@ -25,7 +25,7 @@ import (
 
 var (
 	// Retry up to 3 times after the initial daemon request. Each retry waits
-	// for the daemon to come back for up to a minute so `roborev fix --open`
+	// for the daemon to come back for up to a minute so `roborev fix`
 	// can survive daemon restarts without immediately aborting.
 	fixDaemonMaxRetries          = 3
 	fixDaemonRecoveryWait        = 1 * time.Minute
@@ -43,8 +43,8 @@ func fixCmd() *cobra.Command {
 		reasoning   string
 		minSeverity string
 		quiet       bool
-		open        bool
-		unaddressed bool // deprecated alias for open
+		open        bool // deprecated, silently ignored
+		unaddressed bool // deprecated, silently ignored
 		allBranches bool
 		newestFirst bool
 		branch      string
@@ -65,20 +65,19 @@ The agent runs synchronously in your terminal, streaming output as it
 works. The review output is printed first so you can see what needs
 fixing. When complete, the job is closed.
 
-Use --open to automatically discover and fix all open completed jobs
-for the current repo.
+With no arguments, discovers and fixes all open completed jobs on the
+current branch.
 
 Examples:
+  roborev fix                            # Fix all open jobs on current branch
   roborev fix 123                        # Fix a single job
   roborev fix 123 124 125                # Fix multiple jobs sequentially
   roborev fix --agent claude-code 123    # Use a specific agent
-  roborev fix --open                     # Fix all open jobs on current branch
-  roborev fix --open --branch main
+  roborev fix --branch main              # Fix all open jobs on main
   roborev fix --all-branches             # Fix all open jobs across all branches
   roborev fix --batch 123 124 125        # Batch multiple jobs into one prompt
   roborev fix --batch                    # Batch all open jobs on current branch
   roborev fix --list                     # List open jobs without fixing
-  roborev fix --open --list              # Same as above
 `,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -91,27 +90,17 @@ Examples:
 				_ = git.EnsureAbsoluteHooksPath(root)
 			}
 
-			// Support deprecated --unaddressed as alias for --open
-			if unaddressed {
-				open = true
-			}
-			if allBranches && !open && !batch && !list {
-				open = true
-			}
-			if branch != "" && !open && !batch && !list {
-				return fmt.Errorf("--branch requires --open, --batch, or --list")
-			}
 			if allBranches && branch != "" {
 				return fmt.Errorf("--all-branches and --branch are mutually exclusive")
 			}
-			if newestFirst && !open && !batch && !list {
-				return fmt.Errorf("--newest-first requires --open, --batch, or --list")
+			if allBranches && len(args) > 0 {
+				return fmt.Errorf("--all-branches cannot be used with positional job IDs")
 			}
-			if open && len(args) > 0 {
-				return fmt.Errorf("--open cannot be used with positional job IDs")
+			if branch != "" && len(args) > 0 {
+				return fmt.Errorf("--branch cannot be used with positional job IDs")
 			}
-			if batch && open {
-				return fmt.Errorf("--batch and --open are mutually exclusive (--batch without args already discovers open jobs)")
+			if newestFirst && len(args) > 0 {
+				return fmt.Errorf("--newest-first cannot be used with positional job IDs")
 			}
 			if list && len(args) > 0 {
 				return fmt.Errorf("--list cannot be used with positional job IDs")
@@ -170,13 +159,16 @@ Examples:
 						}
 						effectiveBranch = git.GetCurrentBranch(repoRoot)
 					}
-					return runFixBatch(cmd, nil, effectiveBranch, newestFirst, opts)
+					return runFixBatch(cmd, nil, effectiveBranch, allBranches, branch != "", newestFirst, opts)
 				}
-				return runFixBatch(cmd, jobIDs, "", false, opts)
+				return runFixBatch(cmd, jobIDs, "", false, false, false, opts)
 			}
 
-			if open || len(args) == 0 {
-				// Default to current branch unless --branch or --all-branches is set
+			if len(args) == 0 {
+				// Resolve branch for API query filtering.
+				// --branch X: use explicit branch
+				// --all-branches: empty string (no filter)
+				// default: current branch
 				effectiveBranch := branch
 				if !allBranches && effectiveBranch == "" {
 					workDir, err := os.Getwd()
@@ -189,7 +181,7 @@ Examples:
 					}
 					effectiveBranch = git.GetCurrentBranch(repoRoot)
 				}
-				return runFixOpen(cmd, effectiveBranch, newestFirst, opts)
+				return runFixOpen(cmd, effectiveBranch, allBranches, branch != "", newestFirst, opts)
 			}
 
 			// Parse job IDs
@@ -211,13 +203,14 @@ Examples:
 	cmd.Flags().StringVar(&reasoning, "reasoning", "", "reasoning level: fast, standard, medium, thorough, or maximum")
 	cmd.Flags().StringVar(&minSeverity, "min-severity", "", "minimum finding severity to address: critical, high, medium, or low")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress progress output")
-	cmd.Flags().BoolVar(&open, "open", false, "fix all open completed jobs for the current repo")
-	cmd.Flags().BoolVar(&unaddressed, "unaddressed", false, "deprecated: use --open")
-	cmd.Flags().StringVar(&branch, "branch", "", "filter by branch (default: current branch; requires --open)")
-	cmd.Flags().BoolVar(&allBranches, "all-branches", false, "include open jobs from all branches (implies --open)")
-	cmd.Flags().BoolVar(&newestFirst, "newest-first", false, "process jobs newest first instead of oldest first (requires --open)")
+	cmd.Flags().BoolVar(&open, "open", false, "deprecated: open is now the default behavior")
+	cmd.Flags().BoolVar(&unaddressed, "unaddressed", false, "deprecated: open is now the default behavior")
+	cmd.Flags().StringVar(&branch, "branch", "", "filter by branch (default: current branch)")
+	cmd.Flags().BoolVar(&allBranches, "all-branches", false, "include open jobs from all branches")
+	cmd.Flags().BoolVar(&newestFirst, "newest-first", false, "process jobs newest first instead of oldest first")
 	cmd.Flags().BoolVar(&batch, "batch", false, "concatenate reviews into a single prompt for the agent")
-	cmd.Flags().BoolVar(&list, "list", false, "list open jobs without fixing (implies --open)")
+	cmd.Flags().BoolVar(&list, "list", false, "list open jobs without fixing")
+	_ = cmd.Flags().MarkHidden("open")
 	_ = cmd.Flags().MarkHidden("unaddressed")
 	registerAgentCompletion(cmd)
 	registerReasoningCompletion(cmd)
@@ -427,7 +420,19 @@ func runFixWithSeen(cmd *cobra.Command, jobIDs []int64, opts fixOptions, seen ma
 	return nil
 }
 
-func runFixOpen(cmd *cobra.Command, branch string, newestFirst bool, opts fixOptions) error {
+// runFixOpen discovers and fixes open jobs.
+//
+// branch is used for the API query filter (current branch, explicit
+// --branch, or "" for --all-branches). allBranches controls local
+// filtering: when true, filterReachableJobs is skipped entirely.
+// When false and the user passed --branch, the explicit branch is
+// forwarded as a branchOverride for branch-field matching. When false
+// and no --branch was passed, "" is used so filterReachableJobs falls
+// back to commit-graph reachability.
+//
+// explicitBranch should be true when the caller set --branch (as
+// opposed to auto-resolving the current branch).
+func runFixOpen(cmd *cobra.Command, branch string, allBranches, explicitBranch, newestFirst bool, opts fixOptions) error {
 	// Ensure daemon is running
 	if err := ensureDaemon(); err != nil {
 		return err
@@ -458,7 +463,18 @@ func runFixOpen(cmd *cobra.Command, branch string, newestFirst bool, opts fixOpt
 		if err != nil {
 			return err
 		}
-		jobs = filterReachableJobs(worktreeRoot, "", jobs)
+		// --all-branches: skip filtering, user wants everything.
+		// --branch X: pass branch so filterReachableJobs uses
+		// branch-field matching (cross-branch from worktree).
+		// Default: pass "" so filterReachableJobs uses commit-graph
+		// reachability for SHA/range refs.
+		if !allBranches {
+			filterBranch := ""
+			if explicitBranch {
+				filterBranch = branch
+			}
+			jobs = filterReachableJobs(worktreeRoot, filterBranch, jobs)
+		}
 
 		// Filter out jobs we've already processed
 		var newIDs []int64
@@ -501,10 +517,11 @@ func runFixOpen(cmd *cobra.Command, branch string, newestFirst bool, opts fixOpt
 // graph; non-SHA refs (dirty, empty, task labels) fall back to
 // branch matching. branchOverride is the explicit --branch value
 // for non-mutating flows (e.g. --list); when set, all job types
-// use branch matching, so cross-branch listing works for SHA/range
-// jobs too. Mutating flows (--open, --batch) must pass "" so that
-// fixes are never applied to the wrong checkout. On git errors the
-// job is kept (fail open) to avoid silently dropping work.
+// use branch matching so cross-branch listing works for SHA/range
+// jobs too. Mutating flows (fix, --batch) pass "" so that
+// commit-graph reachability is checked. Callers that want all
+// branches (--all-branches) skip this function entirely. On git
+// errors the job is kept (fail open) to avoid silently dropping work.
 func filterReachableJobs(
 	worktreeRoot, branchOverride string,
 	jobs []storage.ReviewJob,
@@ -737,7 +754,7 @@ func runFixList(cmd *cobra.Command, branch string, newestFirst bool) error {
 	}
 
 	cmd.Printf("To apply a fix: roborev fix <job_id>\n")
-	cmd.Printf("To apply all:   roborev fix --open\n")
+	cmd.Printf("To apply all:   roborev fix\n")
 
 	return nil
 }
@@ -934,7 +951,7 @@ type batchEntry struct {
 
 // runFixBatch discovers jobs (or uses provided IDs), splits them into batches
 // respecting max prompt size, and runs each batch as a single agent invocation.
-func runFixBatch(cmd *cobra.Command, jobIDs []int64, branch string, newestFirst bool, opts fixOptions) error {
+func runFixBatch(cmd *cobra.Command, jobIDs []int64, branch string, allBranches, explicitBranch, newestFirst bool, opts fixOptions) error {
 	if err := ensureDaemon(); err != nil {
 		return err
 	}
@@ -963,7 +980,13 @@ func runFixBatch(cmd *cobra.Command, jobIDs []int64, branch string, newestFirst 
 		if queryErr != nil {
 			return queryErr
 		}
-		jobs = filterReachableJobs(repoRoot, "", jobs)
+		if !allBranches {
+			filterBranch := ""
+			if explicitBranch {
+				filterBranch = branch
+			}
+			jobs = filterReachableJobs(repoRoot, filterBranch, jobs)
+		}
 		jobIDs = make([]int64, len(jobs))
 		for i, j := range jobs {
 			jobIDs[i] = j.ID
