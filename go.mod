@@ -13,7 +13,7 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/google/go-cmp v0.7.0
 	github.com/google/uuid v1.6.0
-	github.com/jackc/pgx/v5 v5.8.0
+	github.com/jackc/pgx/v5 v5.9.1
 	github.com/mattn/go-isatty v0.0.20
 	github.com/mattn/go-runewidth v0.0.21
 	github.com/muesli/termenv v0.16.0
@@ -23,7 +23,7 @@ require (
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/term v0.41.0
 	gopkg.in/yaml.v3 v3.0.1
-	modernc.org/sqlite v1.46.2
+	modernc.org/sqlite v1.47.0
 )
 
 require (
