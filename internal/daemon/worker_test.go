@@ -1156,3 +1156,80 @@ func TestFailOrRetryInner_RetryExhaustedPassesBackupModel(t *testing.T) {
 		}, "model=%q, want backup-model", updated.Model)
 	}
 }
+
+func TestAutoClosePassingReviews(t *testing.T) {
+	t.Parallel()
+
+	// Register a test agent whose output parses as a clear pass verdict.
+	const passAgentName = "auto-close-pass-agent"
+	agent.Register(&agent.FakeAgent{
+		NameStr: passAgentName,
+		ReviewFn: func(_ context.Context, _, _, _ string, w io.Writer) (string, error) {
+			out := "No issues found."
+			_, _ = w.Write([]byte(out))
+			return out, nil
+		},
+	})
+	t.Cleanup(func() { agent.Unregister(passAgentName) })
+
+	tests := []struct {
+		name       string
+		enabled    bool
+		wantClosed bool
+	}{
+		{"enabled", true, true},
+		{"disabled", false, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tc := newWorkerTestContext(t, 1)
+			cfg := config.DefaultConfig()
+			cfg.AutoClosePassingReviews = tt.enabled
+			tc.reconfigurePool(cfg)
+
+			sha := testutil.GetHeadSHA(t, tc.TmpDir)
+			job := tc.createAndClaimJobWithAgent(t, sha, testWorkerID, passAgentName)
+
+			tc.Pool.processJob(testWorkerID, job)
+
+			tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
+			review, err := tc.DB.GetReviewByJobID(job.ID)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantClosed, review.Closed)
+		})
+	}
+
+	// Non-review job types must never be auto-closed, even with the setting enabled.
+	t.Run("skips_non_review_jobs", func(t *testing.T) {
+		t.Parallel()
+		tc := newWorkerTestContext(t, 1)
+		cfg := config.DefaultConfig()
+		cfg.AutoClosePassingReviews = true
+		tc.reconfigurePool(cfg)
+
+		sha := testutil.GetHeadSHA(t, tc.TmpDir)
+		commit, err := tc.DB.GetOrCreateCommit(tc.Repo.ID, sha, "Author", "Subject", time.Now())
+		require.NoError(t, err)
+		job, err := tc.DB.EnqueueJob(storage.EnqueueOpts{
+			RepoID:   tc.Repo.ID,
+			CommitID: commit.ID,
+			GitRef:   sha,
+			Agent:    passAgentName,
+			JobType:  "task",
+			Prompt:   "test prompt",
+		})
+		require.NoError(t, err)
+		claimed, err := tc.DB.ClaimJob(testWorkerID)
+		require.NoError(t, err)
+		require.Equal(t, job.ID, claimed.ID)
+
+		tc.Pool.processJob(testWorkerID, claimed)
+
+		tc.assertJobStatus(t, job.ID, storage.JobStatusDone)
+		review, err := tc.DB.GetReviewByJobID(job.ID)
+		require.NoError(t, err)
+		assert.False(t, review.Closed, "task job should not be auto-closed")
+	})
+}
