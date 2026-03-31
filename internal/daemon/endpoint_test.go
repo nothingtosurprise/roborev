@@ -76,11 +76,76 @@ func TestDefaultSocketPath(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix sockets not supported on Windows")
 	}
-	path := DefaultSocketPath()
-	assert.Less(t, len(path), MaxUnixPathLen,
-		"default socket path %q (%d bytes) exceeds limit %d", path, len(path), MaxUnixPathLen)
-	assert.Contains(t, path, "roborev-")
-	assert.True(t, strings.HasSuffix(path, "daemon.sock"))
+
+	t.Run("UsesXDGRuntimeDirWhenSet", func(t *testing.T) {
+		// Use a short path so the socket path stays under MaxUnixPathLen
+		// (104 on macOS). t.TempDir() paths are too long on macOS.
+		dir, err := os.MkdirTemp("/tmp", "rr-xdg-*")
+		require.NoError(t, err)
+		t.Cleanup(func() { os.RemoveAll(dir) })
+		t.Setenv("XDG_RUNTIME_DIR", dir)
+		path := DefaultSocketPath()
+		assert.Less(t, len(path), MaxUnixPathLen,
+			"default socket path %q (%d bytes) exceeds limit %d",
+			path, len(path), MaxUnixPathLen)
+		assert.Equal(t, filepath.Join(dir, "roborev", "daemon.sock"), path)
+	})
+
+	t.Run("FallsBackWhenXDGIsRelative", func(t *testing.T) {
+		t.Setenv("XDG_RUNTIME_DIR", "relative/path")
+		path := DefaultSocketPath()
+		assert.NotContains(t, path, "relative/path",
+			"should fall back to tempdir for relative XDG_RUNTIME_DIR")
+		assert.Contains(t, path, fmt.Sprintf("roborev-%d", os.Getuid()))
+	})
+
+	t.Run("FallsBackWhenXDGDoesNotExist", func(t *testing.T) {
+		t.Setenv("XDG_RUNTIME_DIR", "/nonexistent-roborev-test-dir")
+		path := DefaultSocketPath()
+		assert.NotContains(t, path, "nonexistent-roborev-test-dir",
+			"should fall back to tempdir for missing XDG_RUNTIME_DIR")
+		assert.Contains(t, path, fmt.Sprintf("roborev-%d", os.Getuid()))
+	})
+
+	t.Run("FallsBackWhenXDGIsAFile", func(t *testing.T) {
+		f := filepath.Join(t.TempDir(), "not-a-dir")
+		require.NoError(t, os.WriteFile(f, nil, 0o600))
+		t.Setenv("XDG_RUNTIME_DIR", f)
+		path := DefaultSocketPath()
+		assert.NotContains(t, path, "not-a-dir",
+			"should fall back to tempdir when XDG_RUNTIME_DIR is a file")
+		assert.Contains(t, path, fmt.Sprintf("roborev-%d", os.Getuid()))
+	})
+
+	t.Run("FallsBackWhenXDGPathTooLong", func(t *testing.T) {
+		// Build a real, deeply nested directory whose joined socket
+		// path exceeds MaxUnixPathLen so the length check is the
+		// branch that triggers the fallback, not os.Stat.
+		base := t.TempDir()
+		deep := base
+		for len(filepath.Join(deep, "roborev", "daemon.sock")) < MaxUnixPathLen {
+			deep = filepath.Join(deep, "d")
+		}
+		require.NoError(t, os.MkdirAll(deep, 0o700))
+		t.Setenv("XDG_RUNTIME_DIR", deep)
+		path := DefaultSocketPath()
+		assert.Less(t, len(path), MaxUnixPathLen,
+			"default socket path %q (%d bytes) exceeds limit %d",
+			path, len(path), MaxUnixPathLen)
+		assert.NotContains(t, path, deep,
+			"should fall back to tempdir, not use overlong XDG path")
+		assert.Contains(t, path, fmt.Sprintf("roborev-%d", os.Getuid()))
+	})
+
+	t.Run("UsesTempdirOtherwise", func(t *testing.T) {
+		t.Setenv("XDG_RUNTIME_DIR", "")
+		path := DefaultSocketPath()
+		assert.Less(t, len(path), MaxUnixPathLen,
+			"default socket path %q (%d bytes) exceeds limit %d",
+			path, len(path), MaxUnixPathLen)
+		assert.Contains(t, path, fmt.Sprintf("roborev-%d", os.Getuid()))
+		assert.True(t, strings.HasSuffix(path, "daemon.sock"))
+	})
 }
 
 func TestDaemonEndpoint_BaseURL(t *testing.T) {
