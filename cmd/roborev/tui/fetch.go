@@ -208,13 +208,37 @@ func (m model) fetchMoreJobs() tea.Cmd {
 }
 
 func (m model) fetchStatus() tea.Cmd {
+	gen := m.fetchGen
 	return func() tea.Msg {
 		var status storage.DaemonStatus
 		if err := m.getJSON("/api/status", &status); err != nil {
-			return errMsg(err)
+			return statusErrMsg{err: err, gen: gen}
 		}
-		return statusMsg(status)
+		return statusMsg{status: status, gen: gen}
 	}
+}
+
+// startFetchStatus dispatches fetchStatus if no status fetch is already
+// in flight, and sets the loadingStatus flag. Returns nil if skipped.
+func (m *model) startFetchStatus() tea.Cmd {
+	if m.loadingStatus {
+		return nil
+	}
+	m.loadingStatus = true
+	return m.fetchStatus()
+}
+
+// requestFetchStatus is like startFetchStatus but for paths triggered by
+// daemon state changes (SSE events). If a fetch is already in flight, it
+// marks the current data as stale so handleStatusMsg will dispatch a
+// follow-up fetch when the in-flight one returns.
+func (m *model) requestFetchStatus() tea.Cmd {
+	if m.loadingStatus {
+		m.statusStale = true
+		return nil
+	}
+	m.loadingStatus = true
+	return m.fetchStatus()
 }
 
 func (m model) checkForUpdate() tea.Cmd {
@@ -808,6 +832,7 @@ func (m model) fetchPatch(jobID int64) tea.Cmd {
 
 // fetchFixJobs fetches fix jobs from the daemon.
 func (m model) fetchFixJobs() tea.Cmd {
+	gen := m.fetchGen
 	return func() tea.Msg {
 		params := neturl.Values{}
 		params.Set("job_type", "fix")
@@ -815,8 +840,31 @@ func (m model) fetchFixJobs() tea.Cmd {
 
 		result, err := m.loadJobsPage(params)
 		if err != nil {
-			return fixJobsMsg{err: err}
+			return fixJobsMsg{err: err, gen: gen}
 		}
-		return fixJobsMsg{jobs: result.Jobs}
+		return fixJobsMsg{jobs: result.Jobs, gen: gen}
 	}
+}
+
+// startFetchFixJobs dispatches fetchFixJobs if no fix-jobs fetch is already
+// in flight, and sets the loadingFixJobs flag. Returns nil if skipped.
+func (m *model) startFetchFixJobs() tea.Cmd {
+	if m.loadingFixJobs {
+		return nil
+	}
+	m.loadingFixJobs = true
+	return m.fetchFixJobs()
+}
+
+// requestFetchFixJobs is like startFetchFixJobs but for handlers that follow
+// state-mutating operations (fix enqueue, patch apply). If a fetch is already
+// in flight, it marks the current data as stale so handleFixJobsMsg will
+// dispatch a follow-up fetch when the in-flight one returns.
+func (m *model) requestFetchFixJobs() tea.Cmd {
+	if m.loadingFixJobs {
+		m.fixJobsStale = true
+		return nil
+	}
+	m.loadingFixJobs = true
+	return m.fetchFixJobs()
 }

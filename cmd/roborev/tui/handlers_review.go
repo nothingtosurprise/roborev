@@ -369,7 +369,7 @@ func (m model) handleToggleTasksKey() (tea.Model, tea.Cmd) {
 	}
 	if m.currentView == viewQueue {
 		m.currentView = viewTasks
-		return m, m.fetchFixJobs()
+		return m, m.startFetchFixJobs()
 	}
 	return m, nil
 }

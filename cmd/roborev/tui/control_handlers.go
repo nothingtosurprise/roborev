@@ -394,7 +394,7 @@ func (m model) handleCtrlSetView(
 	m.currentView = v
 	var cmd tea.Cmd
 	if v == viewTasks {
-		cmd = m.fetchFixJobs()
+		cmd = m.startFetchFixJobs()
 	}
 	return m, controlResponse{OK: true}, cmd
 }

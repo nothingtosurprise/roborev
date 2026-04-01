@@ -228,7 +228,11 @@ func (m model) handleJobsMsg(msg jobsMsg) (tea.Model, tea.Cmd) {
 
 // handleStatusMsg processes daemon status updates.
 func (m model) handleStatusMsg(msg statusMsg) (tea.Model, tea.Cmd) {
-	m.status = storage.DaemonStatus(msg)
+	if msg.gen < m.fetchGen {
+		return m, nil // discard pre-reconnect response
+	}
+	m.loadingStatus = false
+	m.status = msg.status
 	m.consecutiveErrors = 0
 	if m.status.Version != "" {
 		m.daemonVersion = m.status.Version
@@ -239,6 +243,11 @@ func (m model) handleStatusMsg(msg statusMsg) (tea.Model, tea.Cmd) {
 	}
 	m.lastConfigReloadCounter = m.status.ConfigReloadCounter
 	m.statusFetchedOnce = true
+	if m.statusStale {
+		m.statusStale = false
+		m.loadingStatus = true
+		return m, m.fetchStatus()
+	}
 	return m, nil
 }
 
@@ -435,6 +444,10 @@ func (m model) handleBranchesMsg(
 func (m model) handleFixJobsMsg(
 	msg fixJobsMsg,
 ) (tea.Model, tea.Cmd) {
+	if msg.gen < m.fetchGen {
+		return m, nil // discard pre-reconnect response
+	}
+	m.loadingFixJobs = false
 	if msg.err != nil {
 		m.err = msg.err
 	} else {
@@ -444,6 +457,14 @@ func (m model) handleFixJobsMsg(
 			len(m.fixJobs) > 0 {
 			m.fixSelectedIdx = len(m.fixJobs) - 1
 		}
+	}
+	// A state-mutating handler requested a refresh while this fetch was
+	// in flight. The data we just received predates that mutation, so
+	// dispatch a follow-up fetch to pick up the latest state.
+	if m.fixJobsStale {
+		m.fixJobsStale = false
+		m.loadingFixJobs = true
+		return m, m.fetchFixJobs()
 	}
 	return m, nil
 }
@@ -724,11 +745,17 @@ func (m model) handleSSEEventMsg() (tea.Model, tea.Cmd) {
 	m.loadingJobs = true
 	cmds := []tea.Cmd{
 		m.fetchJobs(),
-		m.fetchStatus(),
 		waitForSSE(m.sseCh, m.sseStop),
 	}
+	// SSE events signal daemon state changes — use the stale-aware
+	// helpers so a skipped fetch gets retried after the in-flight one.
+	if cmd := m.requestFetchStatus(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
 	if m.tasksWorkflowEnabled() && (m.currentView == viewTasks || m.hasActiveFixJobs()) {
-		cmds = append(cmds, m.fetchFixJobs())
+		if cmd := m.requestFetchFixJobs(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	}
 	return m, tea.Batch(cmds...)
 }
@@ -742,9 +769,14 @@ func (m *model) consumeSSEPendingRefresh() tea.Cmd {
 	}
 	m.ssePendingRefresh = false
 	m.loadingJobs = true
-	cmds := []tea.Cmd{m.fetchJobs(), m.fetchStatus()}
+	cmds := []tea.Cmd{m.fetchJobs()}
+	if cmd := m.requestFetchStatus(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
 	if m.tasksWorkflowEnabled() && (m.currentView == viewTasks || m.hasActiveFixJobs()) {
-		cmds = append(cmds, m.fetchFixJobs())
+		if cmd := m.requestFetchFixJobs(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	}
 	return tea.Batch(cmds...)
 }
@@ -790,9 +822,21 @@ func (m model) handleReconnectMsg(msg reconnectMsg) (tea.Model, tea.Cmd) {
 		m.daemonVersion = msg.version
 	}
 	m.clearFetchFailed()
+	m.fetchGen++   // invalidate pre-reconnect status/fix-jobs responses
+	m.fetchSeq++   // invalidate pre-reconnect jobs responses
 	m.loadingJobs = true
-	cmds := []tea.Cmd{
-		m.fetchJobs(), m.fetchStatus(), m.fetchRepoNames(),
+	m.loadingMore = false
+	cmds := []tea.Cmd{m.fetchJobs(), m.fetchRepoNames()}
+	// Force fetches on reconnect — previous in-flight requests
+	// were against the old connection and will fail or be stale.
+	m.loadingStatus = true
+	m.statusStale = false
+	cmds = append(cmds, m.fetchStatus())
+	m.loadingFixJobs = false
+	m.fixJobsStale = false
+	if m.tasksWorkflowEnabled() {
+		m.loadingFixJobs = true
+		cmds = append(cmds, m.fetchFixJobs())
 	}
 	if cmd := m.fetchUnloadedBranches(); cmd != nil {
 		cmds = append(cmds, cmd)
@@ -843,11 +887,20 @@ func (m model) handleTickMsg(
 ) (tea.Model, tea.Cmd) {
 	// Skip job refresh while pagination or another refresh is in flight
 	if m.loadingMore || m.loadingJobs {
-		return m, tea.Batch(m.tick(), m.fetchStatus())
+		cmds := []tea.Cmd{m.tick()}
+		if cmd := m.startFetchStatus(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		return m, tea.Batch(cmds...)
 	}
-	cmds := []tea.Cmd{m.tick(), m.fetchJobs(), m.fetchStatus()}
+	cmds := []tea.Cmd{m.tick(), m.fetchJobs()}
+	if cmd := m.startFetchStatus(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
 	if m.tasksWorkflowEnabled() && (m.currentView == viewTasks || m.hasActiveFixJobs()) {
-		cmds = append(cmds, m.fetchFixJobs())
+		if cmd := m.startFetchFixJobs(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	}
 	return m, tea.Batch(cmds...)
 }
@@ -907,6 +960,25 @@ func (m model) handlePaginationErrMsg(
 }
 
 // handleErrMsg processes generic error messages.
+func (m model) handleStatusErrMsg(
+	msg statusErrMsg,
+) (tea.Model, tea.Cmd) {
+	if msg.gen < m.fetchGen {
+		return m, nil // discard pre-reconnect error
+	}
+	m.loadingStatus = false
+	m.err = msg.err
+	if m.statusStale {
+		m.statusStale = false
+		m.loadingStatus = true
+		return m, m.fetchStatus()
+	}
+	if cmd := m.handleConnectionError(msg.err); cmd != nil {
+		return m, cmd
+	}
+	return m, nil
+}
+
 func (m model) handleErrMsg(
 	msg errMsg,
 ) (tea.Model, tea.Cmd) {
@@ -928,12 +1000,12 @@ func (m model) handleFixTriggerResultMsg(
 		), 3*time.Second, viewTasks)
 	} else if msg.warning != "" {
 		m.setFlash(msg.warning, 5*time.Second, viewTasks)
-		return m, m.fetchFixJobs()
+		return m, m.requestFetchFixJobs()
 	} else {
 		m.setFlash(fmt.Sprintf(
 			"Fix job #%d enqueued", msg.job.ID,
 		), 3*time.Second, viewTasks)
-		return m, m.fetchFixJobs()
+		return m, m.requestFetchFixJobs()
 	}
 	return m, nil
 }
@@ -970,9 +1042,11 @@ func (m model) handleApplyPatchResultMsg(
 			"Patch for job #%d doesn't apply cleanly"+
 				" - triggering rebase", msg.jobID,
 		), 5*time.Second, viewTasks)
-		return m, tea.Batch(
-			m.triggerRebase(msg.jobID), m.fetchFixJobs(),
-		)
+		cmds := []tea.Cmd{m.triggerRebase(msg.jobID)}
+		if cmd := m.requestFetchFixJobs(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		return m, tea.Batch(cmds...)
 	} else if msg.commitFailed {
 		detail := fmt.Sprintf(
 			"Job #%d: %v", msg.jobID, msg.err,
@@ -992,7 +1066,10 @@ func (m model) handleApplyPatchResultMsg(
 			"Patch from job #%d applied and committed",
 			msg.jobID,
 		), 3*time.Second, viewTasks)
-		cmds := []tea.Cmd{m.fetchFixJobs()}
+		cmds := []tea.Cmd{}
+		if cmd := m.requestFetchFixJobs(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 		if msg.parentJobID > 0 {
 			cmds = append(
 				cmds,
