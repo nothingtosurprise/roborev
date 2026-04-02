@@ -702,11 +702,7 @@ func (p *CIPoller) findLocalRepo(ghRepo string) (*storage.Repo, error) {
 	for _, pattern := range patterns {
 		repo, err := p.db.GetRepoByIdentityCaseInsensitive(pattern)
 		if err != nil {
-			// Propagate ambiguity errors (e.g., multiple repos with same identity)
-			if strings.Contains(err.Error(), "multiple repos") {
-				return nil, fmt.Errorf("ambiguous repo match for %q: %w", ghRepo, err)
-			}
-			continue // Other errors (DB issues) — try next pattern
+			continue // DB errors — try next pattern
 		}
 		if repo != nil {
 			// Skip sync placeholders (root_path == identity) — they don't
@@ -1011,7 +1007,7 @@ func (p *CIPoller) callGitClone(
 // Matching is case-insensitive since GitHub owner/repo names are case-insensitive.
 // Returns an ambiguity error if multiple repos match.
 func (p *CIPoller) findRepoByPartialIdentity(ghRepo string) (*storage.Repo, error) {
-	rows, err := p.db.Query(`SELECT id, root_path, name, identity FROM repos WHERE identity IS NOT NULL AND identity != ''`)
+	rows, err := p.db.Query(`SELECT id, root_path, name, created_at, identity FROM repos WHERE identity IS NOT NULL AND identity != ''`)
 	if err != nil {
 		return nil, err
 	}
@@ -1024,7 +1020,8 @@ func (p *CIPoller) findRepoByPartialIdentity(ghRepo string) (*storage.Repo, erro
 	for rows.Next() {
 		var repo storage.Repo
 		var identity string
-		if err := rows.Scan(&repo.ID, &repo.RootPath, &repo.Name, &identity); err != nil {
+		var createdAt string
+		if err := rows.Scan(&repo.ID, &repo.RootPath, &repo.Name, &createdAt, &identity); err != nil {
 			continue
 		}
 		// Skip sync placeholders (root_path == identity)
@@ -1036,17 +1033,92 @@ func (p *CIPoller) findRepoByPartialIdentity(ghRepo string) (*storage.Repo, erro
 		normalized := strings.ToLower(strings.TrimSuffix(identity, ".git"))
 		if strings.HasSuffix(normalized, "/"+needle) || strings.HasSuffix(normalized, ":"+needle) {
 			repo.Identity = identity
+			if t, err := time.Parse("2006-01-02 15:04:05", createdAt); err == nil {
+				repo.CreatedAt = t
+			} else if t, err := time.Parse(time.RFC3339, createdAt); err == nil {
+				repo.CreatedAt = t
+			}
 			matches = append(matches, repo)
 		}
 	}
 
-	switch len(matches) {
-	case 0:
+	if len(matches) == 0 {
 		return nil, fmt.Errorf("%w matching %q (run 'roborev init' in a local checkout)", errLocalRepoNotFound, ghRepo)
-	case 1:
+	}
+	if len(matches) == 1 {
 		return &matches[0], nil
+	}
+
+	// Only auto-resolve when all matches share the same normalized
+	// identity (same host/remote). Different identities mean different
+	// repos that happen to share the same owner/name suffix — that is
+	// genuinely ambiguous and must remain an error.
+	//
+	// Use scheme-independent normalization so that SSH and HTTPS
+	// remotes for the same host/owner/repo are treated as equivalent.
+	canonical := normalizeIdentityKey(matches[0].Identity)
+	for _, m := range matches[1:] {
+		if normalizeIdentityKey(m.Identity) != canonical {
+			return nil, fmt.Errorf("ambiguous repo match for %q: %d local repos with different remotes match (partial identity)", ghRepo, len(matches))
+		}
+	}
+	return storage.PreferAutoClone(matches), nil
+}
+
+// normalizeIdentityKey extracts a scheme-independent "host/path" key
+// from a repo identity for comparison. Handles HTTPS/SSH URLs and
+// SCP-style remotes (user@host:owner/repo or host:owner/repo).
+// Returns the lowercased, .git-trimmed string as-is for formats it
+// doesn't recognize.
+func normalizeIdentityKey(identity string) string {
+	s := strings.ToLower(strings.TrimSuffix(identity, ".git"))
+
+	// SCP-style: "user@host:owner/repo" or "host:owner/repo"
+	if !strings.Contains(s, "://") {
+		// Strip optional user@ prefix (e.g. "git@host:path").
+		if _, after, ok := strings.Cut(s, "@"); ok {
+			s = after
+		}
+		if host, path, ok := strings.Cut(s, ":"); ok &&
+			!strings.Contains(host, "/") {
+			return host + "/" + path
+		}
+		return s
+	}
+
+	// Standard URL (https://, ssh://, git://, etc.)
+	// Always normalize through Hostname() so IPv6 brackets are
+	// handled consistently, then re-add brackets and non-default
+	// ports as needed.
+	if parsed, err := url.Parse(s); err == nil && parsed.Host != "" {
+		host := parsed.Hostname()
+		if strings.Contains(host, ":") {
+			host = "[" + host + "]"
+		}
+		if port := parsed.Port(); port != "" &&
+			defaultPortForScheme(parsed.Scheme) != port {
+			host += ":" + port
+		}
+		return host + parsed.Path
+	}
+
+	return s
+}
+
+// defaultPortForScheme returns the well-known default port for common
+// git remote URL schemes, or "" if none is known.
+func defaultPortForScheme(scheme string) string {
+	switch scheme {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	case "ssh", "git+ssh", "ssh+git":
+		return "22"
+	case "git":
+		return "9418"
 	default:
-		return nil, fmt.Errorf("ambiguous repo match for %q: %d local repos match (partial identity)", ghRepo, len(matches))
+		return ""
 	}
 }
 

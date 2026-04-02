@@ -232,13 +232,9 @@ func (db *DB) GetRepoByIdentityCaseInsensitive(identity string) (*Repo, error) {
 	}
 	defer rows.Close()
 
-	var r Repo
-	var count int
+	var matches []Repo
 	for rows.Next() {
-		count++
-		if count > 1 {
-			return nil, fmt.Errorf("multiple repos found with identity %q", identity)
-		}
+		var r Repo
 		var createdAt string
 		var identityVal sql.NullString
 		if err := rows.Scan(&r.ID, &r.RootPath, &r.Name, &createdAt, &identityVal); err != nil {
@@ -248,14 +244,58 @@ func (db *DB) GetRepoByIdentityCaseInsensitive(identity string) (*Repo, error) {
 		if identityVal.Valid {
 			r.Identity = identityVal.String
 		}
+		matches = append(matches, r)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("get repo by identity (ci): %w", err)
 	}
-	if count == 0 {
+	if len(matches) == 0 {
 		return nil, nil
 	}
-	return &r, nil
+	if len(matches) == 1 {
+		return &matches[0], nil
+	}
+	return PreferAutoClone(matches), nil
+}
+
+// PreferAutoClone picks the best repo from multiple matches.
+// It prefers auto-clones (root_path under {DataDir}/clones/) since CI
+// manages those and they won't have dirty working tree state.
+// If no auto-clone is found, it returns the most recently created repo.
+// Sync placeholders (root_path == identity) are skipped defensively.
+func PreferAutoClone(repos []Repo) *Repo {
+	// Filter out sync placeholders that don't have a real checkout.
+	filtered := repos[:0:0]
+	for _, r := range repos {
+		if r.RootPath != r.Identity {
+			filtered = append(filtered, r)
+		}
+	}
+	if len(filtered) == 0 {
+		// All entries are placeholders — return first original match
+		// so callers can handle it (findLocalRepo skips placeholders).
+		return &repos[0]
+	}
+	repos = filtered
+
+	if len(repos) == 1 {
+		return &repos[0]
+	}
+
+	clonesPrefix := config.DataDir() + "/clones/"
+	for i := range repos {
+		if strings.HasPrefix(repos[i].RootPath, clonesPrefix) {
+			return &repos[i]
+		}
+	}
+	// No auto-clone found — return most recently created.
+	best := &repos[0]
+	for i := 1; i < len(repos); i++ {
+		if repos[i].CreatedAt.After(best.CreatedAt) {
+			best = &repos[i]
+		}
+	}
+	return best
 }
 
 // SyncableJob contains job data needed for sync

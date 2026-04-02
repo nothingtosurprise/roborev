@@ -1593,72 +1593,194 @@ func TestCIPollerProcessPR_IncompleteBatchRecovery(t *testing.T) {
 	})
 }
 
-func TestCIPollerFindLocalRepo_AmbiguousRepoError(t *testing.T) {
+func TestCIPollerFindLocalRepo_AmbiguousRepoResolved(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("ROBOREV_DATA_DIR", dataDir)
+
 	db := testutil.OpenTestDB(t)
 
-	// Create two repos with the same identity (different local paths)
-	if _, err := db.Exec(`INSERT INTO repos (root_path, name, identity) VALUES (?, ?, ?)`,
-		"/tmp/clone1", "api", "https://github.com/acme/api.git"); err != nil {
-		require.Condition(t, func() bool {
-			return false
-		}, "insert repo1: %v", err)
-	}
-	if _, err := db.Exec(`INSERT INTO repos (root_path, name, identity) VALUES (?, ?, ?)`,
-		"/tmp/clone2", "api", "https://github.com/acme/api.git"); err != nil {
-		require.Condition(t, func() bool {
-			return false
-		}, "insert repo2: %v", err)
-	}
+	autoClonePath := dataDir + "/clones/acme/api"
+	userCheckout := "/home/user/projects/api"
+
+	// Create a user checkout and an auto-clone with the same identity
+	_, err := db.Exec(`INSERT INTO repos (root_path, name, identity) VALUES (?, ?, ?)`,
+		userCheckout, "api", "https://github.com/acme/api.git")
+	require.NoError(t, err, "insert user checkout")
+
+	_, err = db.Exec(`INSERT INTO repos (root_path, name, identity) VALUES (?, ?, ?)`,
+		autoClonePath, "api", "https://github.com/acme/api.git")
+	require.NoError(t, err, "insert auto-clone")
 
 	cfg := config.DefaultConfig()
 	p := NewCIPoller(db, NewStaticConfig(cfg), nil)
 
-	_, err := p.findLocalRepo("acme/api")
-	if err == nil {
-		require.Condition(t, func() bool {
-			return false
-		}, "expected error for ambiguous repo match")
-	}
-	if !strings.Contains(err.Error(), "ambiguous") {
-		require.Condition(t, func() bool {
-			return false
-		}, "expected ambiguity error, got: %v", err)
-	}
+	found, err := p.findLocalRepo("acme/api")
+	require.NoError(t, err)
+	require.NotNil(t, found)
+	assert.Equal(t, autoClonePath, found.RootPath, "should prefer auto-clone over user checkout")
 }
 
-func TestCIPollerFindLocalRepo_PartialIdentityAmbiguity(t *testing.T) {
+func TestCIPollerFindLocalRepo_AmbiguousRepoFallsBackToNewest(t *testing.T) {
 	db := testutil.OpenTestDB(t)
 
-	// Create two repos with identities that DON'T match the exact patterns
-	// tried by findLocalRepo (which only checks github.com), so they fall
-	// through to partial suffix matching where both match "acme/widgets"
-	if _, err := db.Exec(`INSERT INTO repos (root_path, name, identity) VALUES (?, ?, ?)`,
-		"/tmp/clone-ghe1", "widgets", "git@ghe.corp.com:acme/widgets.git"); err != nil {
-		require.Condition(t, func() bool {
-			return false
-		}, "insert repo1: %v", err)
-	}
-	if _, err := db.Exec(`INSERT INTO repos (root_path, name, identity) VALUES (?, ?, ?)`,
-		"/tmp/clone-ghe2", "widgets", "https://ghe.corp.com/acme/widgets"); err != nil {
-		require.Condition(t, func() bool {
-			return false
-		}, "insert repo2: %v", err)
-	}
+	// Create two user checkouts (no auto-clone) — should pick most recently created
+	_, err := db.Exec(`INSERT INTO repos (root_path, name, identity, created_at) VALUES (?, ?, ?, ?)`,
+		"/tmp/clone1", "api", "https://github.com/acme/api.git", "2024-01-01 00:00:00")
+	require.NoError(t, err, "insert repo1")
+
+	_, err = db.Exec(`INSERT INTO repos (root_path, name, identity, created_at) VALUES (?, ?, ?, ?)`,
+		"/tmp/clone2", "api", "https://github.com/acme/api.git", "2025-06-15 00:00:00")
+	require.NoError(t, err, "insert repo2")
 
 	cfg := config.DefaultConfig()
 	p := NewCIPoller(db, NewStaticConfig(cfg), nil)
 
-	_, err := p.findLocalRepo("acme/widgets")
-	if err == nil {
-		require.Condition(t, func() bool {
-			return false
-		}, "expected error for ambiguous partial repo match")
+	found, err := p.findLocalRepo("acme/api")
+	require.NoError(t, err)
+	require.NotNil(t, found)
+	assert.Equal(t, "/tmp/clone2", found.RootPath, "should pick most recently created repo")
+}
+
+func TestCIPollerFindLocalRepo_PartialIdentitySameHostResolved(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("ROBOREV_DATA_DIR", dataDir)
+
+	db := testutil.OpenTestDB(t)
+
+	autoClonePath := dataDir + "/clones/acme/widgets"
+
+	// Two repos with the same host (ghe.corp.com) but different URL
+	// schemes (SSH vs HTTPS). They share the same normalized identity
+	// so disambiguation should succeed — preferring the auto-clone.
+	_, err := db.Exec(`INSERT INTO repos (root_path, name, identity) VALUES (?, ?, ?)`,
+		"/tmp/clone-ghe1", "widgets", "git@ghe.corp.com:acme/widgets.git")
+	require.NoError(t, err, "insert user checkout (SSH)")
+
+	_, err = db.Exec(`INSERT INTO repos (root_path, name, identity) VALUES (?, ?, ?)`,
+		autoClonePath, "widgets", "https://ghe.corp.com/acme/widgets.git")
+	require.NoError(t, err, "insert auto-clone (HTTPS)")
+
+	cfg := config.DefaultConfig()
+	p := NewCIPoller(db, NewStaticConfig(cfg), nil)
+
+	found, err := p.findLocalRepo("acme/widgets")
+	require.NoError(t, err)
+	require.NotNil(t, found)
+	assert.Equal(t, autoClonePath, found.RootPath, "should prefer auto-clone in partial identity match")
+}
+
+func TestCIPollerFindLocalRepo_PartialIdentityCrossHostAmbiguity(t *testing.T) {
+	db := testutil.OpenTestDB(t)
+
+	// Two repos from different hosts that share the same owner/repo suffix.
+	// These are genuinely different repos — should remain an error.
+	_, err := db.Exec(`INSERT INTO repos (root_path, name, identity) VALUES (?, ?, ?)`,
+		"/tmp/clone-ghe1", "widgets", "git@ghe.corp.com:acme/widgets.git")
+	require.NoError(t, err)
+
+	_, err = db.Exec(`INSERT INTO repos (root_path, name, identity) VALUES (?, ?, ?)`,
+		"/tmp/clone-ghe2", "widgets", "https://gitlab.com/acme/widgets")
+	require.NoError(t, err)
+
+	cfg := config.DefaultConfig()
+	p := NewCIPoller(db, NewStaticConfig(cfg), nil)
+
+	_, err = p.findLocalRepo("acme/widgets")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ambiguous")
+}
+
+func TestNormalizeIdentityKey(t *testing.T) {
+	tests := []struct {
+		name     string
+		identity string
+		want     string
+	}{
+		{
+			name:     "SCP-style with user@ and .git",
+			identity: "git@ghe.corp.com:acme/widgets.git",
+			want:     "ghe.corp.com/acme/widgets",
+		},
+		{
+			name:     "SCP-style without user@",
+			identity: "ghe.corp.com:acme/widgets.git",
+			want:     "ghe.corp.com/acme/widgets",
+		},
+		{
+			name:     "HTTPS with .git",
+			identity: "https://ghe.corp.com/acme/widgets.git",
+			want:     "ghe.corp.com/acme/widgets",
+		},
+		{
+			name:     "SSH scheme with .git",
+			identity: "ssh://ghe.corp.com/acme/widgets.git",
+			want:     "ghe.corp.com/acme/widgets",
+		},
+		{
+			name:     "case insensitive",
+			identity: "GIT@GHE.CORP.COM:Acme/Widgets.git",
+			want:     "ghe.corp.com/acme/widgets",
+		},
+		{
+			name:     "HTTPS non-default port preserved",
+			identity: "https://ghe.example.com:8443/acme/widgets.git",
+			want:     "ghe.example.com:8443/acme/widgets",
+		},
+		{
+			name:     "HTTPS default port stripped",
+			identity: "https://ghe.example.com:443/acme/widgets.git",
+			want:     "ghe.example.com/acme/widgets",
+		},
+		{
+			name:     "IPv6 without port",
+			identity: "https://[2001:db8::1]/acme/widgets.git",
+			want:     "[2001:db8::1]/acme/widgets",
+		},
+		{
+			name:     "IPv6 with default port stripped",
+			identity: "https://[2001:db8::1]:443/acme/widgets.git",
+			want:     "[2001:db8::1]/acme/widgets",
+		},
+		{
+			name:     "IPv6 with non-default port preserved",
+			identity: "https://[2001:db8::1]:8443/acme/widgets.git",
+			want:     "[2001:db8::1]:8443/acme/widgets",
+		},
+		{
+			name:     "SSH default port stripped",
+			identity: "ssh://git@ghe.corp.com:22/acme/widgets.git",
+			want:     "ghe.corp.com/acme/widgets",
+		},
+		{
+			name:     "local identity unchanged",
+			identity: "local:///home/user/repo",
+			want:     "local:///home/user/repo",
+		},
 	}
-	if !strings.Contains(err.Error(), "ambiguous") {
-		require.Condition(t, func() bool {
-			return false
-		}, "expected ambiguity error, got: %v", err)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizeIdentityKey(tt.identity)
+			assert.Equal(t, tt.want, got)
+		})
 	}
+
+	// SSH (git@) and HTTPS for the same host/repo must match.
+	sshKey := normalizeIdentityKey("git@ghe.corp.com:acme/widgets.git")
+	httpsKey := normalizeIdentityKey("https://ghe.corp.com/acme/widgets.git")
+	assert.Equal(t, sshKey, httpsKey,
+		"SSH and HTTPS remotes for the same host/repo must normalize identically")
+
+	// Explicit default port must match omitted port.
+	withDefault := normalizeIdentityKey("https://ghe.example.com:443/acme/widgets.git")
+	withoutPort := normalizeIdentityKey("https://ghe.example.com/acme/widgets.git")
+	assert.Equal(t, withDefault, withoutPort,
+		"explicit default port must match omitted port")
+
+	// Non-default port must NOT match omitted port.
+	nonDefault := normalizeIdentityKey("https://ghe.example.com:8443/acme/widgets.git")
+	assert.NotEqual(t, nonDefault, withoutPort,
+		"non-default port must produce a different key")
 }
 
 func TestCIPollerFindOrCloneRepo_AutoClones(t *testing.T) {
@@ -2297,48 +2419,42 @@ func TestCIPollerFindOrCloneRepo_CloneFailure(t *testing.T) {
 	}
 }
 
-func TestCIPollerFindOrCloneRepo_PropagatesAmbiguity(t *testing.T) {
+func TestCIPollerFindOrCloneRepo_ResolvesAmbiguity(t *testing.T) {
 	db := testutil.OpenTestDB(t)
 
-	// Create two repos with the same identity (ambiguous match)
-	for _, path := range []string{"/tmp/c1", "/tmp/c2"} {
-		if _, err := db.Exec(
-			`INSERT INTO repos (root_path, name, identity)
-			 VALUES (?, ?, ?)`,
-			path, "api", "https://github.com/acme/api.git",
-		); err != nil {
-			require.Condition(t, func() bool {
-				return false
-			}, "insert: %v", err)
-		}
-	}
+	// Create two repos with the same identity — disambiguation should
+	// pick the most recently created one (no auto-clone prefix here).
+	_, err := db.Exec(
+		`INSERT INTO repos (root_path, name, identity, created_at)
+		 VALUES (?, ?, ?, ?)`,
+		"/tmp/c1", "api", "https://github.com/acme/api.git", "2024-01-01 00:00:00",
+	)
+	require.NoError(t, err)
+
+	_, err = db.Exec(
+		`INSERT INTO repos (root_path, name, identity, created_at)
+		 VALUES (?, ?, ?, ?)`,
+		"/tmp/c2", "api", "https://github.com/acme/api.git", "2025-06-15 00:00:00",
+	)
+	require.NoError(t, err)
 
 	cfg := config.DefaultConfig()
 	p := NewCIPoller(db, NewStaticConfig(cfg), nil)
 
-	// Should NOT attempt to clone — ambiguity is a real error
+	// Should NOT attempt to clone — disambiguation resolves it
 	p.gitCloneFn = func(
 		_ context.Context, _, _ string, _ []string,
 	) error {
-		require.Condition(t, func() bool {
-			return false
-		}, "should not clone on ambiguous match")
+		require.Fail(t, "should not clone when disambiguation resolves the match")
 		return nil
 	}
 
-	_, err := p.findOrCloneRepo(
+	found, err := p.findOrCloneRepo(
 		context.Background(), "acme/api",
 	)
-	if err == nil {
-		require.Condition(t, func() bool {
-			return false
-		}, "expected ambiguity error")
-	}
-	if !strings.Contains(err.Error(), "ambiguous") {
-		require.Condition(t, func() bool {
-			return false
-		}, "expected 'ambiguous' in error, got: %v", err)
-	}
+	require.NoError(t, err)
+	require.NotNil(t, found)
+	assert.Equal(t, "/tmp/c2", found.RootPath, "should pick most recently created repo")
 }
 
 func TestCIPollerProcessPR_AutoClonesUnknownRepo(t *testing.T) {
