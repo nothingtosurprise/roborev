@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -116,9 +117,16 @@ Examples:
 			}
 
 			if jsonOutput {
+				// Include comments so tools/skills can see developer feedback.
+				type reviewWithComments struct {
+					storage.Review
+					Comments []storage.Response `json:"comments,omitempty"`
+				}
+				out := reviewWithComments{Review: review}
+				out.Comments = fetchShowComments(client, addr, review)
 				enc := json.NewEncoder(cmd.OutOrStdout())
 				enc.SetIndent("", "  ")
-				return enc.Encode(&review)
+				return enc.Encode(&out)
 			}
 
 			// Avoid redundant "job X (job X, ...)" output
@@ -139,27 +147,14 @@ Examples:
 				fmt.Println(review.Output)
 			}
 
-			// Fetch and display comments
-			commentsURL := addr + fmt.Sprintf(
-				"/api/comments?job_id=%d", review.JobID,
-			)
-			commentsResp, cErr := client.Get(commentsURL)
-			if cErr == nil {
-				defer commentsResp.Body.Close()
-				if commentsResp.StatusCode == http.StatusOK {
-					var result struct {
-						Responses []storage.Response `json:"responses"`
-					}
-					if json.NewDecoder(commentsResp.Body).Decode(&result) == nil &&
-						len(result.Responses) > 0 {
-						fmt.Println()
-						fmt.Println("--- Comments ---")
-						for _, r := range result.Responses {
-							ts := r.CreatedAt.Format("Jan 02 15:04")
-							fmt.Printf("\n[%s] %s:\n", ts, r.Responder)
-							fmt.Println(r.Response)
-						}
-					}
+			// Fetch and display comments (including legacy commit-based)
+			if allComments := fetchShowComments(client, addr, review); len(allComments) > 0 {
+				fmt.Println()
+				fmt.Println("--- Comments ---")
+				for _, r := range allComments {
+					ts := r.CreatedAt.Format("Jan 02 15:04")
+					fmt.Printf("\n[%s] %s:\n", ts, r.Responder)
+					fmt.Println(r.Response)
 				}
 			}
 
@@ -171,4 +166,52 @@ Examples:
 	cmd.Flags().BoolVar(&showPrompt, "prompt", false, "show the prompt sent to the agent instead of the review output")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output as JSON")
 	return cmd
+}
+
+// fetchShowComments retrieves comments for a review, merging legacy
+// SHA-based comments via storage.MergeResponses.
+func fetchShowComments(client *http.Client, addr string, review storage.Review) []storage.Response {
+	var responses []storage.Response
+
+	// Fetch by job ID
+	commentsURL := addr + fmt.Sprintf("/api/comments?job_id=%d", review.JobID)
+	if resp, err := client.Get(commentsURL); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not fetch comments for job %d: %v\n", review.JobID, err)
+	} else if resp != nil {
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			var result struct {
+				Responses []storage.Response `json:"responses"`
+			}
+			if json.NewDecoder(resp.Body).Decode(&result) == nil {
+				responses = result.Responses
+			}
+		}
+	}
+
+	// Also fetch legacy commit-based comments and merge.
+	// Prefer commit_id (unambiguous), fall back to SHA for legacy jobs.
+	var legacyURL string
+	if review.Job != nil && review.Job.CommitID != nil {
+		legacyURL = addr + fmt.Sprintf("/api/comments?commit_id=%d", *review.Job.CommitID)
+	} else if review.Job != nil && git.LooksLikeSHA(review.Job.GitRef) {
+		legacyURL = addr + fmt.Sprintf("/api/comments?sha=%s", review.Job.GitRef)
+	}
+	if legacyURL != "" {
+		if resp, err := client.Get(legacyURL); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not fetch legacy comments: %v\n", err)
+		} else if resp != nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				var result struct {
+					Responses []storage.Response `json:"responses"`
+				}
+				if json.NewDecoder(resp.Body).Decode(&result) == nil {
+					responses = storage.MergeResponses(responses, result.Responses)
+				}
+			}
+		}
+	}
+
+	return responses
 }

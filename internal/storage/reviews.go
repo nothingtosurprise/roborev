@@ -3,6 +3,7 @@ package storage
 import (
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -523,4 +524,52 @@ func (db *DB) GetCommentsForCommitSHA(sha string) ([]Response, error) {
 		return nil, err
 	}
 	return db.GetCommentsForCommit(commit.ID)
+}
+
+// GetAllCommentsForJob returns all comments for a job, merging legacy
+// commit-based comments via MergeResponses. When commitID > 0, fetches
+// legacy comments by commit ID. Otherwise, if fallbackSHA is non-empty,
+// fetches by SHA. Callers should validate the SHA (e.g. via
+// git.LooksLikeSHA) before passing it here.
+func (db *DB) GetAllCommentsForJob(jobID, commitID int64, fallbackSHA string) ([]Response, error) {
+	responses, err := db.GetCommentsForJob(jobID)
+	if err != nil {
+		return nil, err
+	}
+
+	var legacyResponses []Response
+	var legacyErr error
+	if commitID > 0 {
+		legacyResponses, legacyErr = db.GetCommentsForCommit(commitID)
+	} else if fallbackSHA != "" {
+		legacyResponses, legacyErr = db.GetCommentsForCommitSHA(fallbackSHA)
+	}
+	if legacyErr != nil {
+		return responses, fmt.Errorf("legacy comment lookup: %w", legacyErr)
+	}
+
+	return MergeResponses(responses, legacyResponses), nil
+}
+
+// MergeResponses deduplicates two Response slices by ID and returns
+// a chronologically sorted result. This is used wherever job-based
+// and legacy commit-based comments are merged.
+func MergeResponses(primary, extra []Response) []Response {
+	if len(extra) == 0 {
+		return primary
+	}
+	seen := make(map[int64]bool, len(primary))
+	for _, r := range primary {
+		seen[r.ID] = true
+	}
+	for _, r := range extra {
+		if !seen[r.ID] {
+			seen[r.ID] = true
+			primary = append(primary, r)
+		}
+	}
+	sort.Slice(primary, func(i, j int) bool {
+		return primary[i].CreatedAt.Before(primary[j].CreatedAt)
+	})
+	return primary
 }

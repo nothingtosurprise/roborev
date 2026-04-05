@@ -2,9 +2,10 @@ package storage
 
 import (
 	"database/sql"
+	"testing"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"testing"
 )
 
 // TestAddCommentToJobAllStates verifies that comments can be added to jobs
@@ -125,6 +126,97 @@ func TestAddCommentToJobWithNoReview(t *testing.T) {
 
 	assert.NotNil(t, resp)
 	assert.Equal(t, "Comment on job without review", resp.Response)
+}
+
+func TestGetAllCommentsForJob(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	_, commit, job := createJobChain(t, db, "/tmp/test-repo", "abc1234")
+	machineID, _ := db.GetMachineID()
+
+	// Insert with explicit timestamps to avoid flaky ordering
+	t1 := "2026-03-15T10:00:00Z"
+	t2 := "2026-03-15T11:00:00Z"
+	t3 := "2026-03-15T12:00:00Z"
+
+	_, err := db.Exec(
+		`INSERT INTO responses (job_id, responder, response, uuid, source_machine_id, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		job.ID, "alice", "Job-based comment", GenerateUUID(), machineID, t1,
+	)
+	require.NoError(t, err)
+
+	_, err = db.Exec(
+		`INSERT INTO responses (commit_id, responder, response, uuid, source_machine_id, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		commit.ID, "bob", "Legacy commit comment", GenerateUUID(), machineID, t2,
+	)
+	require.NoError(t, err)
+
+	t.Run("merges job and legacy commit comments", func(t *testing.T) {
+		all, err := db.GetAllCommentsForJob(job.ID, commit.ID, "")
+		require.NoError(t, err)
+		require.Len(t, all, 2)
+		assert.Equal(t, "alice", all[0].Responder)
+		assert.Equal(t, "bob", all[1].Responder)
+	})
+
+	t.Run("skips legacy fallback when commitID is zero and no gitRef", func(t *testing.T) {
+		all, err := db.GetAllCommentsForJob(job.ID, 0, "")
+		require.NoError(t, err)
+		require.Len(t, all, 1)
+		assert.Equal(t, "alice", all[0].Responder)
+	})
+
+	t.Run("falls back to SHA when commitID is zero", func(t *testing.T) {
+		all, err := db.GetAllCommentsForJob(job.ID, 0, "abc1234")
+		require.NoError(t, err)
+		require.Len(t, all, 2)
+		assert.Equal(t, "alice", all[0].Responder)
+		assert.Equal(t, "bob", all[1].Responder)
+	})
+
+	t.Run("skips fallback when SHA is empty", func(t *testing.T) {
+		// Callers pass "" when gitRef is not a valid SHA (e.g. ranges).
+		all, err := db.GetAllCommentsForJob(job.ID, 0, "")
+		require.NoError(t, err)
+		require.Len(t, all, 1)
+	})
+
+	t.Run("deduplicates overlapping comments", func(t *testing.T) {
+		// Insert a response linked to both job_id AND commit_id to
+		// exercise the dedup branch — it appears in both queries.
+		_, err := db.Exec(
+			`INSERT INTO responses (job_id, commit_id, responder, response, uuid, source_machine_id, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			job.ID, commit.ID, "charlie", "Dual-linked comment",
+			GenerateUUID(), machineID, t3,
+		)
+		require.NoError(t, err)
+
+		all, err := db.GetAllCommentsForJob(job.ID, commit.ID, "")
+		require.NoError(t, err)
+		// alice (job), bob (commit), charlie (both) — charlie should
+		// appear only once despite matching both queries.
+		require.Len(t, all, 3)
+		assert.Equal(t, "alice", all[0].Responder)
+		assert.Equal(t, "bob", all[1].Responder)
+		assert.Equal(t, "charlie", all[2].Responder)
+	})
+
+	t.Run("returns error on legacy lookup failure", func(t *testing.T) {
+		// Use a hex string that looks like a SHA but doesn't exist in the
+		// commits table to trigger a legacy lookup error.
+		all, err := db.GetAllCommentsForJob(job.ID, 0, "deadbeefdeadbeef")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "legacy comment lookup")
+		// Job-based comments should still be returned (alice + charlie
+		// which was dual-linked in the dedup subtest above).
+		require.Len(t, all, 2)
+		assert.Equal(t, "alice", all[0].Responder)
+		assert.Equal(t, "charlie", all[1].Responder)
+	})
 }
 
 func TestGetReviewByJobIDIncludesModel(t *testing.T) {

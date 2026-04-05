@@ -428,9 +428,6 @@ func TestCompactWorktreeBranchResolution(t *testing.T) {
 	opts := compactOptions{quiet: true}
 	_ = runCompact(cmd, opts)
 
-	// API query should use the main repo path, not the worktree path.
-	// Branch filtering is handled client-side by filterReachableJobs.
 	require.NotEmpty(t, receivedRepo, "expected repo param to be sent")
-	assert.Equal(t, repo.Dir, receivedRepo,
-		"repo: want main repo path")
+	assert.Equal(t, repo.Dir, receivedRepo, "repo: want main repo path")
 }

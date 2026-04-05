@@ -383,6 +383,43 @@ func (c *HTTPClient) GetCommentsForJob(jobID int64) ([]storage.Response, error) 
 	return result.Responses, nil
 }
 
+// GetAllCommentsForJob fetches comments for a job, merging legacy
+// commit-based comments via storage.MergeResponses. When commitID > 0,
+// fetches legacy by commit ID. Otherwise, if gitRef looks like a SHA,
+// fetches by SHA. Callers may pre-validate gitRef via git.LooksLikeSHA.
+func (c *HTTPClient) GetAllCommentsForJob(jobID, commitID int64, gitRef string) ([]storage.Response, error) {
+	responses, err := c.GetCommentsForJob(jobID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Also fetch legacy commit-based comments.
+	// Prefer commit_id (unambiguous), fall back to SHA only when
+	// gitRef looks like a hex commit SHA (not a task label).
+	var legacyURL string
+	if commitID > 0 {
+		legacyURL = fmt.Sprintf("%s/api/comments?commit_id=%d", c.baseURL, commitID)
+	} else if git.LooksLikeSHA(gitRef) {
+		legacyURL = fmt.Sprintf("%s/api/comments?sha=%s", c.baseURL, gitRef)
+	}
+	if legacyURL != "" {
+		legacyResp, err := c.httpClient.Get(legacyURL)
+		if err == nil {
+			defer legacyResp.Body.Close()
+			if legacyResp.StatusCode == http.StatusOK {
+				var result struct {
+					Responses []storage.Response `json:"responses"`
+				}
+				if json.NewDecoder(legacyResp.Body).Decode(&result) == nil {
+					responses = storage.MergeResponses(responses, result.Responses)
+				}
+			}
+		}
+	}
+
+	return responses, nil
+}
+
 // RemapResult is the response from POST /api/remap.
 type RemapResult struct {
 	Remapped int `json:"remapped"`

@@ -24,6 +24,7 @@ import (
 	"github.com/roborev-dev/roborev/internal/config"
 	"github.com/roborev-dev/roborev/internal/git"
 	"github.com/roborev-dev/roborev/internal/githook"
+	"github.com/roborev-dev/roborev/internal/prompt"
 	"github.com/roborev-dev/roborev/internal/storage"
 	"github.com/roborev-dev/roborev/internal/version"
 )
@@ -2040,7 +2041,7 @@ func (s *Server) handleListComments(w http.ResponseWriter, r *http.Request) {
 	var responses []storage.Response
 	var err error
 
-	// Support lookup by job_id (preferred) or sha (legacy)
+	// Support lookup by job_id (preferred), commit_id, or sha (legacy)
 	if jobIDStr := r.URL.Query().Get("job_id"); jobIDStr != "" {
 		jobID, parseErr := strconv.ParseInt(jobIDStr, 10, 64)
 		if parseErr != nil {
@@ -2052,6 +2053,17 @@ func (s *Server) handleListComments(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("get responses: %v", err))
 			return
 		}
+	} else if cidStr := r.URL.Query().Get("commit_id"); cidStr != "" {
+		commitID, parseErr := strconv.ParseInt(cidStr, 10, 64)
+		if parseErr != nil {
+			writeError(w, http.StatusBadRequest, "invalid commit_id")
+			return
+		}
+		responses, err = s.db.GetCommentsForCommit(commitID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("get responses: %v", err))
+			return
+		}
 	} else if sha := r.URL.Query().Get("sha"); sha != "" {
 		responses, err = s.db.GetCommentsForCommitSHA(sha)
 		if err != nil {
@@ -2059,7 +2071,7 @@ func (s *Server) handleListComments(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		writeError(w, http.StatusBadRequest, "job_id or sha parameter required")
+		writeError(w, http.StatusBadRequest, "job_id, commit_id, or sha parameter required")
 		return
 	}
 
@@ -2508,10 +2520,21 @@ func (s *Server) handleFixJob(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "parent job has no review to fix")
 			return
 		}
+		// Fetch comments for context (user feedback, previous tool attempts),
+		// including legacy commit-based comments.
+		commitID := parentJob.CommitIDValue()
+		var fallbackSHA string
+		if commitID == 0 && git.LooksLikeSHA(parentJob.GitRef) {
+			fallbackSHA = parentJob.GitRef
+		}
+		comments, commentsErr := s.db.GetAllCommentsForJob(req.ParentJobID, commitID, fallbackSHA)
+		if commentsErr != nil {
+			log.Printf("fix job for parent %d: failed to fetch comments: %v", req.ParentJobID, commentsErr)
+		}
 		if req.Prompt != "" {
-			fixPrompt = buildFixPromptWithInstructions(review.Output, req.Prompt)
+			fixPrompt = buildFixPromptWithInstructions(review.Output, req.Prompt, comments)
 		} else {
-			fixPrompt = buildFixPrompt(review.Output)
+			fixPrompt = buildFixPromptWithInstructions(review.Output, "", comments)
 		}
 	}
 
@@ -2814,23 +2837,22 @@ func parseDuration(s string) (time.Duration, error) {
 	}
 }
 
-// buildFixPrompt constructs a prompt for fixing review findings.
-func buildFixPrompt(reviewOutput string) string {
-	return buildFixPromptWithInstructions(reviewOutput, "")
-}
-
 // buildFixPromptWithInstructions constructs a fix prompt that includes the review
-// findings and optional user-provided instructions.
-func buildFixPromptWithInstructions(reviewOutput, userInstructions string) string {
-	prompt := "# Fix Request\n\n" +
+// findings, optional user-provided instructions, and any comments/responses
+// (split into tool attempts and user comments for proper framing).
+func buildFixPromptWithInstructions(reviewOutput, userInstructions string, responses []storage.Response) string {
+	toolAttempts, userComments := prompt.SplitResponses(responses)
+	p := "# Fix Request\n\n" +
 		"An analysis was performed and produced the following findings:\n\n" +
 		"## Analysis Findings\n\n" +
 		reviewOutput + "\n\n"
+	p += prompt.FormatToolAttempts(toolAttempts)
+	p += prompt.FormatUserComments(userComments)
 	if userInstructions != "" {
-		prompt += "## Additional Instructions\n\n" +
+		p += "## Additional Instructions\n\n" +
 			userInstructions + "\n\n"
 	}
-	prompt += "## Instructions\n\n" +
+	p += "## Instructions\n\n" +
 		"Please apply the suggested changes from the analysis above. " +
 		"Make the necessary edits to address each finding. " +
 		"Focus on the highest priority items first.\n\n" +
@@ -2838,7 +2860,7 @@ func buildFixPromptWithInstructions(reviewOutput, userInstructions string) strin
 		"1. Verify the code still compiles/passes linting\n" +
 		"2. Run any relevant tests to ensure nothing is broken\n" +
 		"3. Stage the changes with git add but do NOT commit — the changes will be captured as a patch\n"
-	return prompt
+	return p
 }
 
 // buildRebasePrompt constructs a prompt for re-applying a stale patch to current HEAD.

@@ -87,7 +87,7 @@ func TestBuildGenericFixPrompt(t *testing.T) {
 - Long function in main.go:50
 - Missing error handling`
 
-	prompt := buildGenericFixPrompt(analysisOutput, "")
+	prompt := buildGenericFixPrompt(analysisOutput, "", nil)
 
 	// Should include the analysis output
 	assert.Contains(t, prompt, "Issues Found")
@@ -98,6 +98,63 @@ func TestBuildGenericFixPrompt(t *testing.T) {
 
 	// Should request a commit
 	assert.Contains(t, prompt, "git commit")
+}
+
+func TestBuildGenericFixPromptWithComments(t *testing.T) {
+	comments := []storage.Response{
+		{Responder: "dev", Response: "Don't touch the helper function", CreatedAt: time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC)},
+	}
+	p := buildGenericFixPrompt("Found bug in foo.go", "", comments)
+
+	assert.Contains(t, p, "User Comments")
+	assert.Contains(t, p, "Don't touch the helper function")
+	assert.Contains(t, p, "Found bug in foo.go")
+}
+
+func TestBuildGenericFixPromptSplitsMixedResponses(t *testing.T) {
+	responses := []storage.Response{
+		{Responder: "roborev-fix", Response: "Fix applied (commit: abc123)", CreatedAt: time.Date(2026, 3, 15, 9, 0, 0, 0, time.UTC)},
+		{Responder: "alice", Response: "This is a false positive", CreatedAt: time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC)},
+	}
+	p := buildGenericFixPrompt("Found bug in foo.go", "", responses)
+
+	// Tool attempts should appear under "Previous Addressing Attempts"
+	assert.Contains(t, p, "Previous Addressing Attempts")
+	assert.Contains(t, p, "roborev-fix")
+
+	// User comments should appear under "User Comments"
+	assert.Contains(t, p, "User Comments")
+	assert.Contains(t, p, "false positive")
+	assert.Contains(t, p, "alice")
+}
+
+func TestBuildBatchFixPromptSplitsMixedResponses(t *testing.T) {
+	entries := []batchEntry{
+		{
+			jobID: 1,
+			job:   &storage.ReviewJob{GitRef: "abc123"},
+			review: &storage.Review{
+				Output: "Found HIGH bug in foo.go",
+			},
+			comments: []storage.Response{
+				{Responder: "roborev-refine", Response: "Created commit def456", CreatedAt: time.Date(2026, 3, 15, 9, 0, 0, 0, time.UTC)},
+				{Responder: "alice", Response: "The foo.go finding is a false positive", CreatedAt: time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC)},
+			},
+		},
+	}
+	p := buildBatchFixPrompt(entries, "")
+
+	// Tool attempts should appear under "Previous Addressing Attempts"
+	assert.Contains(t, p, "Previous Addressing Attempts")
+	assert.Contains(t, p, "roborev-refine")
+
+	// User comments should appear under "User Comments"
+	assert.Contains(t, p, "User Comments")
+	assert.Contains(t, p, "false positive")
+	assert.Contains(t, p, "alice")
+
+	// Review output should be present
+	assert.Contains(t, p, "Found HIGH bug in foo.go")
 }
 
 func TestBuildGenericCommitPrompt(t *testing.T) {
@@ -2692,7 +2749,7 @@ func TestBuildGenericFixPromptMinSeverity(t *testing.T) {
 	output := "Found bug in foo.go"
 
 	t.Run("no filter", func(t *testing.T) {
-		p := buildGenericFixPrompt(output, "")
+		p := buildGenericFixPrompt(output, "", nil)
 		if strings.Contains(p, "Severity filter") {
 			assert.Condition(t, func() bool {
 				return false
@@ -2706,7 +2763,7 @@ func TestBuildGenericFixPromptMinSeverity(t *testing.T) {
 	})
 
 	t.Run("high filter", func(t *testing.T) {
-		p := buildGenericFixPrompt(output, "high")
+		p := buildGenericFixPrompt(output, "high", nil)
 		if !strings.Contains(p, "Severity filter") {
 			assert.Condition(t, func() bool {
 				return false
@@ -2725,7 +2782,7 @@ func TestBuildGenericFixPromptMinSeverity(t *testing.T) {
 	})
 
 	t.Run("low filter is no-op", func(t *testing.T) {
-		p := buildGenericFixPrompt(output, "low")
+		p := buildGenericFixPrompt(output, "low", nil)
 		if strings.Contains(p, "Severity filter") {
 			assert.Condition(t, func() bool {
 				return false
@@ -3015,28 +3072,6 @@ func TestFilterReachableJobsDetachedHead(t *testing.T) {
 				gotIDs = append(gotIDs, j.ID)
 			}
 			assert.Equal(t, tt.wantIDs, gotIDs)
-		})
-	}
-}
-
-func TestLooksLikeSHA(t *testing.T) {
-	tests := []struct {
-		s    string
-		want bool
-	}{
-		{"abc1234", true},
-		{"0000000000000000000000000000000000000000", true},
-		{"abcdef1234567890abcdef1234567890abcdef12", true},
-		{"abc123", false},         // too short (6 chars)
-		{"", false},               // empty
-		{"dirty", false},          // non-hex
-		{"run", false},            // task label
-		{"ABCDEF1", false},        // uppercase not valid
-		{"abc123..def456", false}, // range
-	}
-	for _, tt := range tests {
-		t.Run(tt.s, func(t *testing.T) {
-			assert.Equal(t, tt.want, looksLikeSHA(tt.s))
 		})
 	}
 }
