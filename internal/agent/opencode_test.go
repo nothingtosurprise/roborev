@@ -183,7 +183,7 @@ func TestOpenCodeReviewNoOutput(t *testing.T) {
 	assertEqual(t, result, "No review output generated")
 }
 
-func TestOpenCodeReviewStderrStreamedToOutput(t *testing.T) {
+func TestOpenCodeReviewStderrNotStreamedToOutput(t *testing.T) {
 	t.Parallel()
 	skipIfWindows(t)
 
@@ -196,7 +196,13 @@ func TestOpenCodeReviewStderrStreamedToOutput(t *testing.T) {
 		MockOpts: MockCLIOpts{
 			CaptureStdin: true,
 			StdoutLines:  stdoutLines,
-			StderrLines:  []string{"warning: something"},
+			StderrLines: []string{
+				"Performing one time database migration, may take a few minutes...",
+				"sqlite-migration:0",
+				"sqlite-migration:done",
+				"Database migration complete.",
+				"warning: something",
+			},
 		},
 		Prompt: "prompt",
 		Writer: &outputBuf,
@@ -205,9 +211,46 @@ func TestOpenCodeReviewStderrStreamedToOutput(t *testing.T) {
 
 	assertEqual(t, result, "Review done")
 
+	// opencode's stderr is intentionally suppressed from the live
+	// log because it is dominated by sqlite-migration noise. Real
+	// errors still surface via formatDetailedCLIWaitError on
+	// non-zero exit (covered by TestOpenCodeReviewPartialOnError).
 	outStr := outputBuf.String()
 	assertContains(t, outStr, `"type":"text"`)
-	assertContains(t, outStr, "warning: something")
+	assertNotContains(t, outStr, "sqlite-migration")
+	assertNotContains(t, outStr, "Performing one time database migration")
+	assertNotContains(t, outStr, "Database migration complete")
+	assertNotContains(t, outStr, "warning: something")
+}
+
+func TestOpenCodeReviewStderrPreservedInError(t *testing.T) {
+	t.Parallel()
+	skipIfWindows(t)
+
+	// StreamStderr is disabled for opencode, so stderr does not
+	// appear in the live log on success. On non-zero exit the
+	// captured stderr must still reach the user via the returned
+	// error, otherwise failure diagnostics would be lost.
+	stdoutLines := []string{makeTextEvent("Partial review")}
+	stderrLines := []string{
+		"Performing one time database migration, may take a few minutes...",
+		"sqlite-migration:done",
+		"Error: authentication token expired",
+	}
+
+	_, _, _, err := executeReviewTest(t, reviewTestOpts{
+		MockOpts: MockCLIOpts{
+			CaptureStdin: true,
+			StdoutLines:  stdoutLines,
+			StderrLines:  stderrLines,
+			ExitCode:     1,
+		},
+		Prompt: "prompt",
+	})
+	require.Error(t, err)
+
+	msg := err.Error()
+	assertContains(t, msg, "Error: authentication token expired")
 }
 
 func TestOpenCodeReviewNilOutput(t *testing.T) {
