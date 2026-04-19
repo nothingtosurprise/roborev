@@ -1,0 +1,2 @@
+*.gotmpl text eol=lf
+*.golden text eol=lf
