@@ -49,7 +49,9 @@ func fixCmd() *cobra.Command {
 		newestFirst bool
 		branch      string
 		batch       bool
+		batchSize   int
 		list        bool
+		resume      bool
 	)
 
 	cmd := &cobra.Command{
@@ -69,14 +71,16 @@ With no arguments, discovers and fixes all open completed jobs on the
 current branch.
 
 Examples:
-  roborev fix                            # Fix all open jobs on current branch
+  roborev fix                            # 1 review per agent call (default)
   roborev fix 123                        # Fix a single job
   roborev fix 123 124 125                # Fix multiple jobs sequentially
   roborev fix --agent claude-code 123    # Use a specific agent
   roborev fix --branch main              # Fix all open jobs on main
   roborev fix --all-branches             # Fix all open jobs across all branches
-  roborev fix --batch 123 124 125        # Batch multiple jobs into one prompt
-  roborev fix --batch                    # Batch all open jobs on current branch
+  roborev fix --batch-size 5             # Up to 5 reviews per agent call
+  roborev fix --batch                    # Pack until max_prompt_size
+  roborev fix --resume                   # Resume agent session across calls
+  roborev fix --batch-size 5 --resume    # 5 per call, session resumed
   roborev fix --list                     # List open jobs without fixing
 `,
 		Args: cobra.ArbitraryArgs,
@@ -108,6 +112,15 @@ Examples:
 			if list && batch {
 				return fmt.Errorf("--list and --batch are mutually exclusive")
 			}
+			if list && batchSize > 0 {
+				return fmt.Errorf("--list and --batch-size are mutually exclusive")
+			}
+			if batch && batchSize > 0 {
+				return fmt.Errorf("--batch and --batch-size are mutually exclusive")
+			}
+			if cmd.Flags().Changed("batch-size") && batchSize < 1 {
+				return fmt.Errorf("--batch-size must be >= 1")
+			}
 			if list {
 				roots, err := resolveCurrentRepoRoots()
 				if err != nil {
@@ -127,9 +140,20 @@ Examples:
 				reasoning:   reasoning,
 				minSeverity: minSeverity,
 				quiet:       quiet,
+				resume:      resume,
 			}
 
-			if batch {
+			roots, err := resolveCurrentRepoRoots()
+			if err != nil {
+				return err
+			}
+			tracker := &fixSessionTracker{
+				enabled: opts.resume,
+				quiet:   opts.quiet,
+				out:     cmd.OutOrStdout(),
+			}
+
+			if batch || batchSize > 0 {
 				var jobIDs []int64
 				for _, arg := range args {
 					var id int64
@@ -141,18 +165,13 @@ Examples:
 				if len(jobIDs) > 0 && (branch != "" || allBranches || newestFirst) {
 					return fmt.Errorf("--branch, --all-branches, and --newest-first cannot be used with explicit job IDs")
 				}
-				// If no args, discover unaddressed jobs
 				if len(jobIDs) == 0 {
-					roots, err := resolveCurrentRepoRoots()
-					if err != nil {
-						return err
-					}
 					effectiveBranch := resolveCurrentBranchFilter(
 						roots.worktreeRoot, branch, allBranches,
 					)
-					return runFixBatch(cmd, nil, effectiveBranch, allBranches, branch != "", newestFirst, opts)
+					return runFixBatch(cmd, nil, effectiveBranch, allBranches, branch != "", newestFirst, batchSize, opts, tracker)
 				}
-				return runFixBatch(cmd, jobIDs, "", false, false, false, opts)
+				return runFixBatch(cmd, jobIDs, "", false, false, false, batchSize, opts, tracker)
 			}
 
 			if len(args) == 0 {
@@ -160,14 +179,10 @@ Examples:
 				// --branch X: use explicit branch
 				// --all-branches: empty string (no filter)
 				// default: current branch
-				roots, err := resolveCurrentRepoRoots()
-				if err != nil {
-					return err
-				}
 				effectiveBranch := resolveCurrentBranchFilter(
 					roots.worktreeRoot, branch, allBranches,
 				)
-				return runFixOpen(cmd, effectiveBranch, allBranches, branch != "", newestFirst, opts)
+				return runFixOpen(cmd, effectiveBranch, allBranches, branch != "", newestFirst, opts, tracker)
 			}
 
 			// Parse job IDs
@@ -180,7 +195,7 @@ Examples:
 				jobIDs = append(jobIDs, id)
 			}
 
-			return runFix(cmd, jobIDs, opts)
+			return runFix(cmd, jobIDs, opts, tracker)
 		},
 	}
 
@@ -195,7 +210,9 @@ Examples:
 	cmd.Flags().BoolVar(&allBranches, "all-branches", false, "include open jobs from all branches")
 	cmd.Flags().BoolVar(&newestFirst, "newest-first", false, "process jobs newest first instead of oldest first")
 	cmd.Flags().BoolVar(&batch, "batch", false, "concatenate reviews into a single prompt for the agent")
+	cmd.Flags().IntVar(&batchSize, "batch-size", 0, "concatenate up to N reviews per agent invocation (cap by count, still bounded by max_prompt_size)")
 	cmd.Flags().BoolVar(&list, "list", false, "list open jobs without fixing")
+	cmd.Flags().BoolVar(&resume, "resume", false, "resume the agent's session ID across calls within this run")
 	_ = cmd.Flags().MarkHidden("open")
 	_ = cmd.Flags().MarkHidden("unaddressed")
 	registerAgentCompletion(cmd)
@@ -210,6 +227,7 @@ type fixOptions struct {
 	reasoning   string
 	minSeverity string
 	quiet       bool
+	resume      bool
 }
 
 // fixJobParams configures a fixJobDirect operation.
@@ -287,7 +305,21 @@ func fixJobDirect(ctx context.Context, params fixJobParams, prompt string) (*fix
 	}
 
 	fmt.Fprint(out, "\nNo commit was created. Re-running agent with commit instructions...\n\n")
-	if _, retryErr := params.Agent.Review(ctx, params.RepoRoot, "HEAD", buildGenericCommitPrompt(), out); retryErr != nil {
+	retryAgent := params.Agent
+	// Thread the first call's session ID into the retry so the commit
+	// step continues the same agent context. Without this, the retry
+	// runs as a fresh session and the caller's tracker captures the
+	// pre-retry session — leaving subsequent jobs to resume stale
+	// context that's missing the actual fix work.
+	if capture, ok := out.(*agent.SessionCaptureWriter); ok {
+		capture.Flush()
+		if id := capture.SessionID(); id != "" {
+			if sa, ok := retryAgent.(agent.SessionAgent); ok {
+				retryAgent = sa.WithSessionID(id)
+			}
+		}
+	}
+	if _, retryErr := retryAgent.Review(ctx, params.RepoRoot, "HEAD", buildGenericCommitPrompt(), out); retryErr != nil {
 		fmt.Fprintf(out, "Warning: commit agent failed: %v\n", retryErr)
 	}
 	if sha, ok := detectNewCommit(params.RepoRoot, headBefore); ok {
@@ -363,11 +395,11 @@ func resolveFixAgent(repoPath string, opts fixOptions) (agent.Agent, error) {
 	return a, nil
 }
 
-func runFix(cmd *cobra.Command, jobIDs []int64, opts fixOptions) error {
-	return runFixWithSeen(cmd, jobIDs, opts, nil)
+func runFix(cmd *cobra.Command, jobIDs []int64, opts fixOptions, tracker *fixSessionTracker) error {
+	return runFixWithSeen(cmd, jobIDs, opts, nil, tracker)
 }
 
-func runFixWithSeen(cmd *cobra.Command, jobIDs []int64, opts fixOptions, seen map[int64]bool) error {
+func runFixWithSeen(cmd *cobra.Command, jobIDs []int64, opts fixOptions, seen map[int64]bool, tracker *fixSessionTracker) error {
 	// Ensure daemon is running
 	if err := ensureDaemon(); err != nil {
 		return err
@@ -384,7 +416,7 @@ func runFixWithSeen(cmd *cobra.Command, jobIDs []int64, opts fixOptions, seen ma
 			cmd.Printf("\n=== Fixing job %d (%d/%d) ===\n", jobID, i+1, len(jobIDs))
 		}
 
-		err := fixSingleJob(cmd, roots.worktreeRoot, jobID, opts)
+		err := fixSingleJob(cmd, roots.worktreeRoot, jobID, opts, tracker)
 		if err != nil {
 			if isConnectionError(err) {
 				return fmt.Errorf("daemon connection lost: %w", err)
@@ -421,7 +453,7 @@ func runFixWithSeen(cmd *cobra.Command, jobIDs []int64, opts fixOptions, seen ma
 //
 // explicitBranch should be true when the caller set --branch (as
 // opposed to auto-resolving the current branch).
-func runFixOpen(cmd *cobra.Command, branch string, allBranches, explicitBranch, newestFirst bool, opts fixOptions) error {
+func runFixOpen(cmd *cobra.Command, branch string, allBranches, explicitBranch, newestFirst bool, opts fixOptions, tracker *fixSessionTracker) error {
 	// Ensure daemon is running
 	if err := ensureDaemon(); err != nil {
 		return err
@@ -494,7 +526,7 @@ func runFixOpen(cmd *cobra.Command, branch string, allBranches, explicitBranch, 
 			}
 		}
 
-		if err := runFixWithSeen(cmd, newIDs, opts, seen); err != nil {
+		if err := runFixWithSeen(cmd, newIDs, opts, seen, tracker); err != nil {
 			return err
 		}
 	}
@@ -795,7 +827,7 @@ func jobVerdict(job *storage.ReviewJob, review *storage.Review) string {
 	return storage.ParseVerdict(review.Output)
 }
 
-func fixSingleJob(cmd *cobra.Command, repoRoot string, jobID int64, opts fixOptions) error {
+func fixSingleJob(cmd *cobra.Command, repoRoot string, jobID int64, opts fixOptions, tracker *fixSessionTracker) error {
 	ctx := cmd.Context()
 	if ctx == nil {
 		ctx = context.Background()
@@ -841,12 +873,6 @@ func fixSingleJob(cmd *cobra.Command, repoRoot string, jobID int64, opts fixOpti
 		cmd.Println()
 	}
 
-	// Resolve agent
-	fixAgent, err := resolveFixAgent(repoRoot, opts)
-	if err != nil {
-		return err
-	}
-
 	// Resolve minimum severity filter (only for review-type jobs;
 	// task/analyze jobs have free-form output without severity labels)
 	var minSev string
@@ -872,31 +898,46 @@ func fixSingleJob(cmd *cobra.Command, repoRoot string, jobID int64, opts fixOpti
 		cmd.Printf("Warning: could not fetch comments for job %d: %v\n", jobID, commentsErr)
 	}
 
+	// Resolve the agent only after every check above that can return
+	// without invoking it. This keeps no-op paths (verdict P, bad
+	// min-severity config, job-not-done) from failing on missing-agent
+	// resolution before the actual reason surfaces.
+	if err := ensureBaseAgent(repoRoot, opts, tracker); err != nil {
+		return err
+	}
+	currentAgent, resuming := tracker.NextAgent()
+
 	if !opts.quiet {
-		cmd.Printf("Running fix agent (%s) to apply changes...\n\n", fixAgent.Name())
+		if resuming {
+			cmd.Printf("Resuming session %s\n", shortSessionID(tracker.last))
+		}
+		cmd.Printf("Running fix agent (%s) to apply changes...\n\n", currentAgent.Name())
 	}
 
 	// Set up output
-	var out io.Writer
+	var underlying = io.Discard
 	var fmtr *streamfmt.Formatter
-	if opts.quiet {
-		out = io.Discard
-	} else {
+	if !opts.quiet {
 		fmtr = streamfmt.New(cmd.OutOrStdout(), streamfmt.WriterIsTerminal(cmd.OutOrStdout()))
-		out = fmtr
+		underlying = fmtr
 	}
+	capture := agent.NewSessionCaptureWriter(underlying, nil)
 
 	result, err := fixJobDirect(ctx, fixJobParams{
 		RepoRoot: repoRoot,
-		Agent:    fixAgent,
-		Output:   out,
+		Agent:    currentAgent,
+		Output:   capture,
 	}, buildGenericFixPrompt(review.Output, minSev, comments))
+	// Flush capture FIRST so session extraction completes before reading SessionID.
+	capture.Flush()
 	if fmtr != nil {
 		fmtr.Flush()
 	}
 	if err != nil {
+		tracker.Reset()
 		return err
 	}
+	tracker.Capture(capture.SessionID())
 
 	if !opts.quiet {
 		fmt.Fprintln(cmd.OutOrStdout())
@@ -956,7 +997,7 @@ type batchEntry struct {
 
 // runFixBatch discovers jobs (or uses provided IDs), splits them into batches
 // respecting max prompt size, and runs each batch as a single agent invocation.
-func runFixBatch(cmd *cobra.Command, jobIDs []int64, branch string, allBranches, explicitBranch, newestFirst bool, opts fixOptions) error {
+func runFixBatch(cmd *cobra.Command, jobIDs []int64, branch string, allBranches, explicitBranch, newestFirst bool, batchSize int, opts fixOptions, tracker *fixSessionTracker) error {
 	if err := ensureDaemon(); err != nil {
 		return err
 	}
@@ -1058,12 +1099,6 @@ func runFixBatch(cmd *cobra.Command, jobIDs []int64, branch string, allBranches,
 		return nil
 	}
 
-	// Resolve agent once
-	fixAgent, err := resolveFixAgent(roots.worktreeRoot, opts)
-	if err != nil {
-		return err
-	}
-
 	// Load global config for severity + prompt-size resolution.
 	cfg, _ := config.LoadGlobal()
 
@@ -1088,13 +1123,23 @@ func runFixBatch(cmd *cobra.Command, jobIDs []int64, branch string, allBranches,
 	// Split into batches by prompt size (after severity resolution
 	// so the severity instruction overhead is accounted for)
 	maxSize := config.ResolveMaxPromptSize(roots.worktreeRoot, cfg)
-	batches := splitIntoBatches(entries, maxSize, minSev)
+	batches := splitIntoBatches(entries, batchSplitOptions{
+		MaxSize:     maxSize,
+		MaxCount:    batchSize,
+		MinSeverity: minSev,
+	})
+
+	if err := ensureBaseAgent(roots.worktreeRoot, opts, tracker); err != nil {
+		return err
+	}
 
 	for i, batch := range batches {
 		batchJobIDs := make([]int64, len(batch))
 		for j, e := range batch {
 			batchJobIDs[j] = e.jobID
 		}
+
+		currentAgent, resuming := tracker.NextAgent()
 
 		if !opts.quiet {
 			cmd.Printf("\n=== Batch %d/%d (jobs %s) ===\n\n", i+1, len(batches), formatJobIDs(batchJobIDs))
@@ -1106,32 +1151,38 @@ func runFixBatch(cmd *cobra.Command, jobIDs []int64, branch string, allBranches,
 				cmd.Println(strings.Repeat("-", 60))
 				cmd.Println()
 			}
-			cmd.Printf("Running fix agent (%s) to apply changes...\n\n", fixAgent.Name())
+			if resuming {
+				cmd.Printf("Resuming session %s\n", shortSessionID(tracker.last))
+			}
+			cmd.Printf("Running fix agent (%s) to apply changes...\n\n", currentAgent.Name())
 		}
 
 		prompt := buildBatchFixPrompt(batch, minSev)
 
-		var out io.Writer
+		var underlying = io.Discard
 		var fmtr *streamfmt.Formatter
-		if opts.quiet {
-			out = io.Discard
-		} else {
+		if !opts.quiet {
 			fmtr = streamfmt.New(cmd.OutOrStdout(), streamfmt.WriterIsTerminal(cmd.OutOrStdout()))
-			out = fmtr
+			underlying = fmtr
 		}
+		capture := agent.NewSessionCaptureWriter(underlying, nil)
 
 		result, err := fixJobDirect(ctx, fixJobParams{
 			RepoRoot: roots.worktreeRoot,
-			Agent:    fixAgent,
-			Output:   out,
+			Agent:    currentAgent,
+			Output:   capture,
 		}, prompt)
+		// Flush capture FIRST so session extraction completes before reading SessionID.
+		capture.Flush()
 		if fmtr != nil {
 			fmtr.Flush()
 		}
 		if err != nil {
+			tracker.Reset()
 			cmd.Printf("Warning: error in batch %d: %v\n", i+1, err)
 			continue
 		}
+		tracker.Capture(capture.SessionID())
 
 		if !opts.quiet {
 			fmt.Fprintln(cmd.OutOrStdout())
@@ -1154,9 +1205,13 @@ func runFixBatch(cmd *cobra.Command, jobIDs []int64, branch string, allBranches,
 		}
 
 		// Mark all jobs in this batch as closed
-		responseText := "Fix applied via `roborev fix --batch`"
+		flagLabel := "--batch"
+		if batchSize > 0 {
+			flagLabel = "--batch-size"
+		}
+		responseText := fmt.Sprintf("Fix applied via `roborev fix %s`", flagLabel)
 		if result.CommitCreated {
-			responseText = fmt.Sprintf("Fix applied via `roborev fix --batch` (commit: %s)", git.ShortSHA(result.NewCommitSHA))
+			responseText = fmt.Sprintf("Fix applied via `roborev fix %s` (commit: %s)", flagLabel, git.ShortSHA(result.NewCommitSHA))
 		}
 		for _, e := range batch {
 			if addErr := addJobResponse(ctx, batchAddr, e.jobID, "roborev-fix", responseText); addErr != nil && !opts.quiet {
@@ -1191,15 +1246,23 @@ func batchEntrySize(index int, e batchEntry) int {
 	return size
 }
 
-// splitIntoBatches groups entries into batches respecting maxSize.
-// Greedily packs reviews; a single oversized review gets its own batch.
-// When minSeverity is non-empty, the severity instruction size is
-// included in the per-batch overhead.
+// batchSplitOptions configures how splitIntoBatches groups entries.
+// Both caps are upper bounds; MaxCount = 0 means "no count cap".
+type batchSplitOptions struct {
+	MaxSize     int    // total prompt bytes per batch, including overhead
+	MaxCount    int    // entries per batch (0 = unbounded)
+	MinSeverity string // forwarded to overhead calculation
+}
+
+// splitIntoBatches groups entries into batches respecting opts.
+// Greedy packing: a batch terminates when adding the next entry would
+// exceed MaxSize, OR when MaxCount > 0 and the batch already has
+// MaxCount entries. A single oversized entry still gets its own batch.
 func splitIntoBatches(
-	entries []batchEntry, maxSize int, minSeverity string,
+	entries []batchEntry, opts batchSplitOptions,
 ) [][]batchEntry {
 	overhead := batchPromptOverhead +
-		len(config.SeverityInstruction(minSeverity))
+		len(config.SeverityInstruction(opts.MinSeverity))
 	var batches [][]batchEntry
 	var current []batchEntry
 	currentSize := 0
@@ -1207,7 +1270,9 @@ func splitIntoBatches(
 	for _, e := range entries {
 		entrySize := batchEntrySize(len(current)+1, e)
 
-		if len(current) > 0 && currentSize+entrySize > maxSize {
+		countFull := opts.MaxCount > 0 && len(current) >= opts.MaxCount
+		sizeFull := len(current) > 0 && currentSize+entrySize > opts.MaxSize
+		if countFull || sizeFull {
 			batches = append(batches, current)
 			current = nil
 			currentSize = 0

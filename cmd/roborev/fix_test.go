@@ -552,7 +552,8 @@ func TestFixSingleJob(t *testing.T) {
 		reasoning: "fast",
 	}
 
-	err := fixSingleJob(cmd, repo.Dir, 99, opts)
+	tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
+	err := fixSingleJob(cmd, repo.Dir, 99, opts, tracker)
 	require.NoError(t, err, "fixSingleJob")
 
 	// Verify output contains expected content
@@ -674,7 +675,10 @@ func TestFixSingleJobRecoversPostFixDaemonCalls(t *testing.T) {
 		reasoning: "fast",
 	}
 
-	err = fixSingleJob(cmd, repo.Dir, 99, opts)
+	base, err := resolveFixAgent(repo.Dir, opts)
+	require.NoError(t, err, "resolveFixAgent")
+	tracker := &fixSessionTracker{base: base, out: io.Discard}
+	err = fixSingleJob(cmd, repo.Dir, 99, opts, tracker)
 	require.NoError(t, err, "fixSingleJob")
 
 	outputStr := output.String()
@@ -703,7 +707,8 @@ func TestFixJobNotComplete(t *testing.T) {
 
 	cmd, _ := newTestCmd(t)
 
-	err := fixSingleJob(cmd, t.TempDir(), 99, fixOptions{agentName: "test"})
+	tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
+	err := fixSingleJob(cmd, t.TempDir(), 99, fixOptions{agentName: "test"}, tracker)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not complete")
 }
@@ -835,7 +840,8 @@ func TestRunFixOpen(t *testing.T) {
 			Build()
 
 		out, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
-			return runFixOpen(cmd, "", false, false, false, fixOptions{agentName: "test"})
+			tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
+			return runFixOpen(cmd, "", false, false, false, fixOptions{agentName: "test"}, tracker)
 		})
 		require.NoError(t, err, "runFixOpen")
 		assert.Contains(t, out, "No open jobs found")
@@ -886,7 +892,8 @@ func TestRunFixOpen(t *testing.T) {
 			Build()
 
 		out, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
-			return runFixOpen(cmd, "", false, false, false, fixOptions{agentName: "test", reasoning: "fast"})
+			tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
+			return runFixOpen(cmd, "", false, false, false, fixOptions{agentName: "test", reasoning: "fast"}, tracker)
 		})
 		require.NoError(t, err, "runFixOpen")
 		assert.Contains(t, out, "Found 2 open job(s)")
@@ -909,7 +916,8 @@ func TestRunFixOpen(t *testing.T) {
 			Build()
 
 		_, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
-			return runFixOpen(cmd, "feature-branch", false, true, false, fixOptions{agentName: "test"})
+			tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
+			return runFixOpen(cmd, "feature-branch", false, true, false, fixOptions{agentName: "test"}, tracker)
 		})
 		require.NoError(t, err, "runFixOpen")
 		assert.Equal(t, "feature-branch", gotBranch)
@@ -924,7 +932,8 @@ func TestRunFixOpen(t *testing.T) {
 			Build()
 
 		_, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
-			return runFixOpen(cmd, "", false, false, false, fixOptions{agentName: "test"})
+			tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
+			return runFixOpen(cmd, "", false, false, false, fixOptions{agentName: "test"}, tracker)
 		})
 		require.Error(t, err, "expected error on server failure")
 		assert.Contains(t, err.Error(), "server error")
@@ -992,10 +1001,11 @@ func TestRunFixOpen(t *testing.T) {
 			Build()
 
 		out, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
+			tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
 			return runFixOpen(cmd, "", true, false, false, fixOptions{
 				agentName: "test",
 				reasoning: "fast",
-			})
+			}, tracker)
 		})
 		require.NoError(t, err, "runFixOpen all-branches")
 		assert.Contains(t, out, "Found 2 open job(s)")
@@ -1062,10 +1072,11 @@ func TestRunFixOpen(t *testing.T) {
 			Build()
 
 		out, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
+			tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
 			return runFixOpen(cmd, "target-branch", false, true, false, fixOptions{
 				agentName: "test",
 				reasoning: "fast",
-			})
+			}, tracker)
 		})
 		require.NoError(t, err, "runFixOpen with explicit branch")
 		// Only job 40 matches; job 41 has wrong branch
@@ -1129,7 +1140,8 @@ func TestRunFixOpenOrdering(t *testing.T) {
 		b.Build()
 
 		out, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
-			return runFixOpen(cmd, "", false, false, false, fixOptions{agentName: "test", reasoning: "fast"})
+			tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
+			return runFixOpen(cmd, "", false, false, false, fixOptions{agentName: "test", reasoning: "fast"}, tracker)
 		})
 		require.NoError(t, err)
 
@@ -1141,7 +1153,8 @@ func TestRunFixOpenOrdering(t *testing.T) {
 		b.Build()
 
 		out, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
-			return runFixOpen(cmd, "", false, false, true, fixOptions{agentName: "test", reasoning: "fast"})
+			tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
+			return runFixOpen(cmd, "", false, false, true, fixOptions{agentName: "test", reasoning: "fast"}, tracker)
 		})
 		require.NoError(t, err)
 
@@ -1208,7 +1221,8 @@ func TestRunFixOpenRequery(t *testing.T) {
 		Build()
 
 	out, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
-		return runFixOpen(cmd, "", false, false, false, fixOptions{agentName: "test", reasoning: "fast"})
+		tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
+		return runFixOpen(cmd, "", false, false, false, fixOptions{agentName: "test", reasoning: "fast"}, tracker)
 	})
 	require.NoError(t, err)
 
@@ -1309,7 +1323,8 @@ func TestRunFixOpenRecoversFromDaemonRestartOnRequery(t *testing.T) {
 		Build()
 
 	out, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
-		return runFixOpen(cmd, "", false, false, false, fixOptions{agentName: "test", reasoning: "fast"})
+		tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
+		return runFixOpen(cmd, "", false, false, false, fixOptions{agentName: "test", reasoning: "fast"}, tracker)
 	})
 	require.NoError(t, err)
 
@@ -1400,6 +1415,42 @@ func TestFixJobDirectUnbornHead(t *testing.T) {
 	})
 }
 
+func TestFixJobDirect_RetryThreadsCapturedSessionID(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	dir := t.TempDir()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@test.com"},
+		{"config", "user.name", "Test"},
+		{"commit", "--allow-empty", "-m", "base"},
+	} {
+		c := exec.Command("git", args...)
+		c.Dir = dir
+		require.NoError(t, c.Run(), "git %v", args)
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("uncommitted"), 0o644))
+
+	tester := agent.NewTestAgent()
+	tester.Delay = 0
+	capture := agent.NewSessionCaptureWriter(io.Discard, nil)
+
+	_, err := fixJobDirect(context.Background(), fixJobParams{
+		RepoRoot: dir,
+		Agent:    tester,
+		Output:   capture,
+	}, "fix things")
+	require.NoError(t, err)
+
+	calls := tester.Calls()
+	require.Len(t, calls, 2, "fixJobDirect should call Review twice when uncommitted changes remain")
+	assert.Empty(t, calls[0].SessionID, "first call is fresh")
+	assert.Equal(t, "test-session-1", calls[1].SessionID,
+		"retry must resume the first call's session so the tracker captures the latest context")
+}
+
 func TestBuildBatchFixPrompt(t *testing.T) {
 	entries := []batchEntry{
 		{
@@ -1459,7 +1510,7 @@ func TestSplitIntoBatches(t *testing.T) {
 			makeEntry(2, 100),
 			makeEntry(3, 100),
 		}
-		batches := splitIntoBatches(entries, 100000, "")
+		batches := splitIntoBatches(entries, batchSplitOptions{MaxSize: 100000})
 		assert.Len(t, batches, 1)
 		assert.Len(t, batches[0], 3)
 	})
@@ -1472,7 +1523,7 @@ func TestSplitIntoBatches(t *testing.T) {
 		}
 		// Set limit small enough that not all fit (overhead ~300 bytes + entry ~530 each)
 		maxSize := 1000
-		batches := splitIntoBatches(entries, maxSize, "")
+		batches := splitIntoBatches(entries, batchSplitOptions{MaxSize: maxSize})
 		assert.GreaterOrEqual(t, len(batches), 2)
 		// All entries should be present across batches
 		total := 0
@@ -1488,7 +1539,7 @@ func TestSplitIntoBatches(t *testing.T) {
 			makeEntry(2, 5000), // oversized
 			makeEntry(3, 100),
 		}
-		batches := splitIntoBatches(entries, 1000, "")
+		batches := splitIntoBatches(entries, batchSplitOptions{MaxSize: 1000})
 		assert.GreaterOrEqual(t, len(batches), 2)
 		// The oversized entry should be alone in its batch
 		found := false
@@ -1503,7 +1554,7 @@ func TestSplitIntoBatches(t *testing.T) {
 	})
 
 	t.Run("empty input", func(t *testing.T) {
-		batches := splitIntoBatches(nil, 100000, "")
+		batches := splitIntoBatches(nil, batchSplitOptions{MaxSize: 100000})
 		assert.Empty(t, batches)
 	})
 
@@ -1517,7 +1568,7 @@ func TestSplitIntoBatches(t *testing.T) {
 			makeEntry(5, 200),
 		}
 		maxSize := 1000
-		batches := splitIntoBatches(entries, maxSize, "")
+		batches := splitIntoBatches(entries, batchSplitOptions{MaxSize: maxSize})
 		for _, batch := range batches {
 			prompt := buildBatchFixPrompt(batch, "")
 			// Single-entry batches that are inherently oversized are allowed to exceed.
@@ -1531,7 +1582,7 @@ func TestSplitIntoBatches(t *testing.T) {
 			makeEntry(20, 100),
 			makeEntry(30, 100),
 		}
-		batches := splitIntoBatches(entries, 100000, "")
+		batches := splitIntoBatches(entries, batchSplitOptions{MaxSize: 100000})
 		assert.Len(t, batches, 1)
 		for i, want := range []int64{10, 20, 30} {
 			assert.Equal(t, want, batches[0][i].jobID)
@@ -1546,8 +1597,8 @@ func TestSplitIntoBatches(t *testing.T) {
 		}
 		// With severity, the overhead is larger so entries may split
 		// into more batches than without severity.
-		batchesNoSev := splitIntoBatches(entries, 1200, "")
-		batchesWithSev := splitIntoBatches(entries, 1200, "high")
+		batchesNoSev := splitIntoBatches(entries, batchSplitOptions{MaxSize: 1200})
+		batchesWithSev := splitIntoBatches(entries, batchSplitOptions{MaxSize: 1200, MinSeverity: "high"})
 		if len(batchesWithSev) < len(batchesNoSev) {
 			assert.Condition(t, func() bool {
 				return false
@@ -1567,6 +1618,69 @@ func TestSplitIntoBatches(t *testing.T) {
 
 			}
 		}
+	})
+
+	t.Run("count cap forces multiple batches when size would allow one", func(t *testing.T) {
+		entries := []batchEntry{
+			makeEntry(1, 100),
+			makeEntry(2, 100),
+			makeEntry(3, 100),
+			makeEntry(4, 100),
+			makeEntry(5, 100),
+		}
+		batches := splitIntoBatches(entries, batchSplitOptions{
+			MaxSize:  100000,
+			MaxCount: 2,
+		})
+		require.Len(t, batches, 3)
+		assert.Len(t, batches[0], 2)
+		assert.Len(t, batches[1], 2)
+		assert.Len(t, batches[2], 1)
+	})
+
+	t.Run("count cap and size cap, count cap dominates", func(t *testing.T) {
+		entries := []batchEntry{
+			makeEntry(1, 100),
+			makeEntry(2, 100),
+			makeEntry(3, 100),
+		}
+		batches := splitIntoBatches(entries, batchSplitOptions{
+			MaxSize:  100000,
+			MaxCount: 1,
+		})
+		require.Len(t, batches, 3)
+		for _, b := range batches {
+			assert.Len(t, b, 1)
+		}
+	})
+
+	t.Run("size cap and count cap, size cap dominates", func(t *testing.T) {
+		entries := []batchEntry{
+			makeEntry(1, 500),
+			makeEntry(2, 500),
+			makeEntry(3, 500),
+		}
+		batches := splitIntoBatches(entries, batchSplitOptions{
+			MaxSize:  1000,
+			MaxCount: 100,
+		})
+		assert.GreaterOrEqual(t, len(batches), 2,
+			"size cap forces a split even though count cap is far higher")
+	})
+
+	t.Run("count cap = 0 means unbounded", func(t *testing.T) {
+		entries := []batchEntry{
+			makeEntry(1, 100),
+			makeEntry(2, 100),
+			makeEntry(3, 100),
+			makeEntry(4, 100),
+		}
+		batches := splitIntoBatches(entries, batchSplitOptions{
+			MaxSize:  100000,
+			MaxCount: 0,
+		})
+		require.Len(t, batches, 1)
+		assert.Len(t, batches[0], 4)
 	})
 }
 
@@ -2059,7 +2173,8 @@ func TestFixWorktreeRepoResolution(t *testing.T) {
 		var buf bytes.Buffer
 		cmd.SetOut(&buf)
 		opts := fixOptions{quiet: true}
-		if err := runFixOpen(cmd, "", false, false, false, opts); err != nil {
+		tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
+		if err := runFixOpen(cmd, "", false, false, false, opts, tracker); err != nil {
 			require.NoError(t, err, "runFixOpen: %v")
 		}
 
@@ -2076,8 +2191,9 @@ func TestFixWorktreeRepoResolution(t *testing.T) {
 		var buf bytes.Buffer
 		cmd.SetOut(&buf)
 		opts := fixOptions{quiet: true}
+		tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
 		// nil jobIDs triggers discovery via queryOpenJobs
-		if err := runFixBatch(cmd, nil, "", false, false, false, opts); err != nil {
+		if err := runFixBatch(cmd, nil, "", false, false, false, 0, opts, tracker); err != nil {
 			require.NoError(t, err, "runFixBatch: %v")
 		}
 
@@ -2224,7 +2340,8 @@ func TestFixSingleJobSkipsPassVerdict(t *testing.T) {
 
 	opts := fixOptions{agentName: "test-pass-skip"}
 
-	err := fixSingleJob(cmd, repo.Dir, 99, opts)
+	tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
+	err := fixSingleJob(cmd, repo.Dir, 99, opts, tracker)
 	require.NoError(t, err, "fixSingleJob")
 
 	outputStr := output.String()
@@ -2306,7 +2423,9 @@ func TestFixBatchSkipsPassVerdict(t *testing.T) {
 			[]int64{10, 20},
 			"",
 			false, false, false,
+			0,
 			fixOptions{agentName: "test", reasoning: "fast"},
+			&fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard},
 		)
 	})
 	require.NoError(t, err, "runFixBatch: %v")
@@ -2379,10 +2498,11 @@ func TestRunFixWithSeenExplicitAbortsOnError(t *testing.T) {
 	setupFixErrorMockDaemon(t, &processedJobs, &mu)
 
 	_, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
+		tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
 		return runFixWithSeen(cmd, []int64{10, 20, 30}, fixOptions{
 			agentName: "test",
 			reasoning: "fast",
-		}, nil)
+		}, nil, tracker)
 	})
 	require.Error(t, err, "expected error for explicit job IDs")
 	assert.Contains(t, err.Error(), "error fixing job 20")
@@ -2405,10 +2525,11 @@ func TestRunFixWithSeenDiscoveryContinuesOnError(t *testing.T) {
 
 	seen := make(map[int64]bool)
 	out, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
+		tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
 		return runFixWithSeen(cmd, []int64{10, 20, 30}, fixOptions{
 			agentName: "test",
 			reasoning: "fast",
-		}, seen)
+		}, seen, tracker)
 	})
 
 	require.NoError(t, err, "runFixWithSeen")
@@ -2476,10 +2597,11 @@ func TestRunFixWithSeenDiscoveryAbortsOnConnectionError(t *testing.T) {
 
 	seen := make(map[int64]bool)
 	_, err := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
+		tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
 		return runFixWithSeen(cmd, []int64{10, 20}, fixOptions{
 			agentName: "test",
 			reasoning: "fast",
-		}, seen)
+		}, seen, tracker)
 	})
 
 	require.Error(t, err, "expected connection error in discovery mode")
@@ -3224,9 +3346,11 @@ func TestRunFixOpenFiltersUnreachableJobs(t *testing.T) {
 	// (effectiveBranch is resolved to the current branch). allBranches
 	// is false, so filterReachableJobs uses commit-graph reachability.
 	_, runErr := runWithOutput(t, worktreeDir, func(cmd *cobra.Command) error {
+		tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
 		return runFixOpen(
 			cmd, "wt-branch", false, false, false,
 			fixOptions{agentName: "test", reasoning: "fast"},
+			tracker,
 		)
 	})
 	require.NoError(t, runErr, "runFixOpen")
@@ -3317,9 +3441,11 @@ func TestRunFixOpenExcludesMergedBranchJobs(t *testing.T) {
 
 	// Run from main with auto-resolved branch (explicitBranch=false).
 	_, runErr := runWithOutput(t, repo.Dir, func(cmd *cobra.Command) error {
+		tracker := &fixSessionTracker{base: agent.NewTestAgent(), out: io.Discard}
 		return runFixOpen(
 			cmd, defaultBranch, false, false, false,
 			fixOptions{agentName: "test", reasoning: "fast"},
+			tracker,
 		)
 	})
 	require.NoError(t, runErr, "runFixOpen")
@@ -3421,6 +3547,57 @@ func TestFilterReachableJobsFeatureBranch(t *testing.T) {
 				gotIDs = append(gotIDs, j.ID)
 			}
 			assert.Equal(t, tt.wantIDs, gotIDs)
+		})
+	}
+}
+
+func TestFixCmd_BatchAndBatchSizeMutuallyExclusive(t *testing.T) {
+	cmd := fixCmd()
+	cmd.SetArgs([]string{"--batch", "--batch-size", "5"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--batch and --batch-size are mutually exclusive")
+}
+
+func TestFixCmd_ListAndBatchSizeMutuallyExclusive(t *testing.T) {
+	cmd := fixCmd()
+	cmd.SetArgs([]string{"--list", "--batch-size", "5"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--list and --batch-size are mutually exclusive")
+}
+
+func TestFixCmd_BatchSizeMustBePositive(t *testing.T) {
+	cmd := fixCmd()
+	cmd.SetArgs([]string{"--batch-size", "0"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--batch-size must be >= 1")
+}
+
+// TestFixCmd_BatchSizeAcceptsBranchFlags asserts that --batch-size is
+// treated equivalently to --batch in the validation path: it can be
+// combined with --branch / --all-branches / --newest-first without
+// being rejected before dispatch. Failures here would surface as an
+// error containing "mutually exclusive" or "cannot be used", not the
+// downstream daemon error these cases produce when validation passes.
+func TestFixCmd_BatchSizeAcceptsBranchFlags(t *testing.T) {
+	cases := [][]string{
+		{"--batch-size", "5", "--branch", "main"},
+		{"--batch-size", "5", "--all-branches"},
+		{"--batch-size", "5", "--newest-first"},
+	}
+	for _, args := range cases {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			cmd := fixCmd()
+			cmd.SetArgs(args)
+			cmd.SetOut(io.Discard)
+			cmd.SetErr(io.Discard)
+			err := cmd.Execute()
+			if err != nil {
+				assert.NotContains(t, err.Error(), "mutually exclusive")
+				assert.NotContains(t, err.Error(), "cannot be used")
+			}
 		})
 	}
 }
