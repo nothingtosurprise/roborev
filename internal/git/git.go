@@ -1353,14 +1353,97 @@ func readUpstreamConfig(repoPath, ref string) (upstreamConfig, bool) {
 	}, true
 }
 
-// GetBranchBase returns roborev's branch.<name>.base config value for ref.
-// Passing an empty ref is equivalent to HEAD.
+// GetBranchBase returns the base ref derived from ref's branch.<name>.base
+// config. Bare names (e.g. "main") are resolved to the remote-tracking ref
+// (e.g. "origin/main") that the local branch tracks when local <name> exists
+// and is an ancestor of the remote-tracking ref — i.e., local <name> is just
+// a stale snapshot of the trunk. Without this, merge-base(local-main, HEAD)
+// walks back to the stale pointer and the resulting range pulls in commits
+// already merged into the remote trunk after a rebase-onto-origin/main.
+// Qualified refs (containing '/') are returned as-is so users can pin to
+// e.g. "upstream/main". Passing an empty ref is equivalent to HEAD.
 func GetBranchBase(repoPath, ref string) string {
 	branch := branchNameForConfig(repoPath, ref)
 	if branch == "" {
 		return ""
 	}
-	return readGitConfig(repoPath, "branch."+branch+".base")
+	raw := readGitConfig(repoPath, "branch."+branch+".base")
+	return resolveConfiguredBase(repoPath, raw)
+}
+
+// resolveConfiguredBase translates a configured base name to the remote-
+// tracking ref it should map to, or returns configValue unchanged when no
+// translation applies. Values that already name a remote-tracking ref
+// unambiguously are passed through; local branch names (including slash-
+// containing names like "release/1.2") are subject to stale-ancestor
+// translation; divergent local branches are also passed through.
+func resolveConfiguredBase(repoPath, configValue string) string {
+	if configValue == "" {
+		return configValue
+	}
+	if isQualifiedRemoteRef(repoPath, configValue) {
+		return configValue
+	}
+	remoteTracking := preferredRemoteTracking(repoPath, configValue)
+	if remoteTracking == "" {
+		return configValue
+	}
+	if !refExists(repoPath, "refs/heads/"+configValue) {
+		return remoteTracking
+	}
+	isAncestor, err := IsAncestor(repoPath, configValue, remoteTracking)
+	if err != nil || !isAncestor {
+		return configValue
+	}
+	return remoteTracking
+}
+
+// isQualifiedRemoteRef reports whether value names a remote-tracking ref
+// that is not shadowed by a same-named local branch. Defers to the local
+// branch when both exist so stale-ancestor translation still applies, and
+// so the resolved base matches git's normal ref lookup precedence
+// (refs/heads beats refs/remotes).
+func isQualifiedRemoteRef(repoPath, value string) bool {
+	if !strings.Contains(value, "/") {
+		return false
+	}
+	if !refExists(repoPath, "refs/remotes/"+value) {
+		return false
+	}
+	if refExists(repoPath, "refs/heads/"+value) {
+		return false
+	}
+	return true
+}
+
+// preferredRemoteTracking returns the remote-tracking ref short name for a
+// branch name, preferring the branch's configured @{upstream} so fork
+// workflows (local main → upstream/main) translate correctly, and falling
+// back to origin/<name> only when no upstream is configured. Returns ""
+// when no remote-tracking counterpart resolves locally; in particular:
+//   - An explicitly configured upstream that does not resolve is NOT
+//     silently substituted with origin/<name> — that would override the
+//     user's choice of remote in fork workflows.
+//   - For slash-containing names, the origin/<name> fallback only applies
+//     when a local branch by that name exists. Otherwise a remote-
+//     qualified value like "upstream/main" whose configured remote-
+//     tracking ref isn't fetched would collapse to "origin/upstream/main",
+//     silently switching to a different remote.
+func preferredRemoteTracking(repoPath, name string) string {
+	if cfg, ok := readUpstreamConfig(repoPath, name); ok {
+		if strings.HasPrefix(cfg.qualified, "refs/remotes/") &&
+			refExists(repoPath, cfg.qualified) {
+			return cfg.short
+		}
+		return ""
+	}
+	if !refExists(repoPath, "refs/remotes/origin/"+name) {
+		return ""
+	}
+	if strings.Contains(name, "/") && !refExists(repoPath, "refs/heads/"+name) {
+		return ""
+	}
+	return "origin/" + name
 }
 
 func branchNameForConfig(repoPath, ref string) string {
